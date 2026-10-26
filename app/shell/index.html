@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>StageMics</title>
+    <!-- Shown for the second or two while the mic service starts; the window then opens its screen. -->
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0d12; color: #f4f6fa; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+      main { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; text-align: center; padding: 24px; box-sizing: border-box; }
+      .logo { width: 72px; height: 72px; border-radius: 22px; background: #b8f25c; display: flex; align-items: center; justify-content: center; }
+      h1 { margin: 0; font-size: 28px; font-weight: 900; }
+      p { margin: 0; max-width: 520px; font-size: 17px; font-weight: 700; color: #9aa3b2; }
+      p.error { color: #ff8e84; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="logo" aria-hidden="true">
+        <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#0b0d12" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0" /><path d="M12 18v3" /></svg>
+      </div>
+      <h1>StageMics</h1>
+      <p id="status">Starting the mic service…</p>
+    </main>
+    <script>
+      window.__micsStatus = (text, error) => {
+        const el = document.getElementById("status");
+        el.textContent = text;
+        el.className = error ? "error" : "";
+      };
+    </script>
+  </body>
+</html>

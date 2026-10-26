@@ -1,0 +1,48 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "StageMics",
+  "version": "../package.json",
+  "identifier": "org.salvation.stagemics",
+  "build": {
+    "frontendDist": "../app/shell",
+    "beforeDevCommand": "pnpm ui:build && node scripts/build-sidecar.ts",
+    "beforeBuildCommand": "pnpm ui:build && node scripts/build-sidecar.ts"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "StageMics",
+        "url": "index.html",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true,
+        "backgroundColor": "#0B0D12",
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Music",
+    "shortDescription": "Scene-by-scene radio-mic control for the Allen & Heath dLive",
+    "createUpdaterArtifacts": true,
+    "externalBin": ["binaries/mics-server"],
+    "resources": { "../app/dist/": "dist/" },
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVENkY0QUM4QzE0NzY3QzkKUldUSlowZkJ5RXB2N2QzbFdBeWYrcGt1emNaU1c2ZnJWU1ZkQ3lFMURxNHl2a1JyWElyU3BGR1AK",
+      "endpoints": ["https://github.com/crownemmanuel/StageMics/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
+    }
+  }
+}

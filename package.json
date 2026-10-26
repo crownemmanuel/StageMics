@@ -1,0 +1,47 @@
+{
+  "name": "stagemics",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "StageMics: scene-by-scene radio-mic control for the Allen & Heath dLive, with a backstage mic check",
+  "scripts": {
+    "dev": "tauri dev",
+    "serve": "node app/server/main.ts",
+    "ui:dev": "vite --config app/ui/vite.config.ts",
+    "ui:build": "vite build --config app/ui/vite.config.ts",
+    "build:sidecar": "node scripts/build-sidecar.ts",
+    "build:installer": "tauri build --config src-tauri/tauri.unsigned.conf.json",
+    "tauri": "tauri",
+    "typecheck": "tsc --noEmit -p app",
+    "check": "node app/check.ts",
+    "mcp": "node app/mcp.ts",
+    "fake-dlive": "node scripts/fake-dlive.ts",
+    "emulator": "cd firebase && npx -y firebase-tools@15.34.0 emulators:start --only auth,database --project demo-mics",
+    "release": "node scripts/release.ts"
+  },
+  "dependencies": {
+    "@fontsource/nunito": "5.3.0",
+    "@tauri-apps/api": "2.12.2",
+    "@tauri-apps/plugin-process": "2.4.0",
+    "@tauri-apps/plugin-updater": "2.14.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "uqr": "0.1.3",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@tailwindcss/vite": "4.3.3",
+    "@tauri-apps/cli": "2.12.1",
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "8.18.2",
+    "@vitejs/plugin-react": "6.1.2",
+    "esbuild": "0.28.2",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.4"
+  },
+  "packageManager": "pnpm@11.10.0"
+}
