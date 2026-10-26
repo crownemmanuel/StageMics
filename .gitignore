@@ -1,7 +1,7 @@
 node_modules/
 dist/
 app/dist/
-build/
+/build/
 .cache/
 src-tauri/target/
 src-tauri/gen/
