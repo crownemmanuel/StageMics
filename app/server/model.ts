@@ -173,6 +173,8 @@ export interface Settings {
   };
   /** The operator screen and its API answer other computers too (off: only this computer). */
   allowRemoteOperator: boolean;
+  /** Network control: OSC commands (LiveStage, a lighting console, Companion…) on this UDP port. */
+  network: { oscEnabled: boolean; oscPort: number };
 }
 
 // ---------------------------------------------------------------- runtime (not saved in the show)
@@ -204,6 +206,8 @@ export interface Runtime {
   /** Send levels the desk reports, keyed by sendKey(). */
   sends: Record<string, number>;
   livestage: { lastAt: number | null; from: string | null; protocol: number | null; lastCommand: string | null };
+  /** The OSC listener as it is now. */
+  osc: { status: "off" | "listening" | "error"; port: number; error: string | null };
   cloud: { status: "off" | "connecting" | "live" | "error"; error: string | null; at: number | null };
   /** Signal meters per mic (0–1). Null until a meter source (e.g. a Dante feed) is plugged in. */
   meters: Record<string, number> | null;
@@ -291,6 +295,7 @@ export function defaultSettings(): Settings {
       cloud: { apiKey: "", projectId: "", databaseURL: "", emulatorHost: "", hostedUrl: "", joinKey: "", refreshToken: "", uid: "" },
     },
     allowRemoteOperator: false,
+    network: { oscEnabled: true, oscPort: 1451 },
   };
 }
 
@@ -471,5 +476,12 @@ export function migrateSettings(raw: unknown): Settings {
       },
     },
     allowRemoteOperator: r.allowRemoteOperator === true,
+    network: {
+      oscEnabled: obj(r.network).oscEnabled !== false,
+      oscPort: (() => {
+        const p = Math.round(num(obj(r.network).oscPort, d.network.oscPort));
+        return p >= 1024 && p <= 65535 ? p : d.network.oscPort;
+      })(),
+    },
   };
 }

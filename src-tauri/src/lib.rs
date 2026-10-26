@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, RunEvent, Url};
 
 const HTTP_PORT: u16 = 1450;
-const OSC_PORT: u16 = 1451;
 
 /// The service this app started (None when it uses one that was already running).
 struct Service(Mutex<Option<Child>>);
@@ -62,7 +61,8 @@ fn start_service(app: AppHandle) {
   let dist = app.path().resource_dir().map(|d| d.join("dist")).unwrap_or_default();
   let mut cmd = Command::new(sidecar_path());
   cmd
-    .args(["--dist", &dist.to_string_lossy(), "--http-port", &HTTP_PORT.to_string(), "--osc-port", &OSC_PORT.to_string()])
+    // The OSC port (network control) is a setting inside the app: Build → Settings → Network control.
+    .args(["--dist", &dist.to_string_lossy(), "--http-port", &HTTP_PORT.to_string()])
     .env("SOUND_APP_VERSION", app.package_info().version.to_string())
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -97,7 +97,6 @@ fn start_service(app: AppHandle) {
   if !ready {
     let why = match code {
       Some(2) => format!("Port {HTTP_PORT} is in use by another program. Close it and start StageMics again."),
-      Some(1) => format!("Port {OSC_PORT} (OSC from LiveStage) is in use by another program. Close it and start StageMics again."),
       _ => format!("The mic service stopped while starting (exit {code:?})."),
     };
     status(&app, &why, true);

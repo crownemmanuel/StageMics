@@ -55,6 +55,7 @@ export const SOUND_COMMANDS = {
   "mics.detect": { description: "Read input names 1–128 from the desk and map mics by names like Drama3 / Dram12." },
   "settings.desk": { description: "{host?, port?, baseChannel?, mode?: desk | dry}" },
   "settings.sync": { description: "{mode?: local | cloud, lanIp?, cloud?: {apiKey, projectId, databaseURL, emulatorHost, hostedUrl}, newJoinKey?: true}" },
+  "settings.network": { description: "Network control: OSC commands in on this UDP port (LiveStage, a lighting console, Companion…). {oscPort?: 1024–65535, oscEnabled?: boolean}" },
   "settings.remote": { description: "Allow the operator screen from other computers. {allow: boolean}" },
   "import.livestage": { description: "Import or re-import scenes from LiveStage (merges). {from: local | bridge | file | json, path?, json?}" },
   "import.sources": { readOnly: true, description: "Where a LiveStage show can be imported from on this computer." },

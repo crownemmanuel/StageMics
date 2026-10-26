@@ -12,7 +12,7 @@
 import "./args.ts";
 import { appendFileSync, readFileSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { SOUND_HTTP_PORT, SOUND_OSC_PORT } from "../../shared/soundProtocol.ts";
+import { SOUND_HTTP_PORT } from "../../shared/soundProtocol.ts";
 import { CloudSync } from "./cloud.ts";
 import { Engine, UserError } from "./engine.ts";
 import { lanAddresses, startHttp, type LogBook } from "./http.ts";
@@ -22,7 +22,8 @@ import { DATA_DIR, loadSettings, loadShow } from "./store.ts";
 import { openAppWindow } from "./window.ts";
 
 const HTTP_PORT = Number(process.env.SOUND_HTTP_PORT) || SOUND_HTTP_PORT;
-const OSC_PORT = Number(process.env.SOUND_OSC_PORT) || SOUND_OSC_PORT;
+/** --osc-port / SOUND_OSC_PORT win (tests); otherwise Build → Settings → Network control decides. */
+const OSC_PORT_FIXED = Number(process.env.SOUND_OSC_PORT) || null;
 const READONLY_DESK = process.env.SOUND_DESK_READONLY === "1";
 const VERSION = process.env.SOUND_APP_VERSION || (() => {
   try {
@@ -133,14 +134,35 @@ setInterval(refreshLan, 15000).unref();
 
 http = startHttp(engine, HTTP_PORT, logBook, log);
 pushLog = (l) => http?.sendLog(l);
-osc = new OscServer(engine, OSC_PORT, log);
+/** (Re)open the OSC listener from the settings. A port that is taken is reported on screen, not fatal. */
+async function startOsc() {
+  osc?.close();
+  osc = null;
+  const port = OSC_PORT_FIXED ?? engine.settings.network.oscPort;
+  engine.rt.osc = { status: "off", port, error: null };
+  if (engine.settings.network.oscEnabled || OSC_PORT_FIXED) {
+    const s = new OscServer(engine, port, log);
+    try {
+      await s.ready;
+      osc = s;
+      engine.rt.osc = { status: "listening", port, error: null };
+    } catch (e) {
+      s.close();
+      const msg = e instanceof Error ? e.message : String(e);
+      engine.rt.osc = { status: "error", port, error: /EADDRINUSE/.test(msg) ? `UDP ${port} is in use by another program` : msg };
+      log(`network control: ${engine.rt.osc.error}`);
+    }
+  }
+  http?.broadcast({ show: false, settings: false, runtime: true });
+}
+engine.hooks.restartOsc = startOsc;
 cloud = new CloudSync(engine, log);
 cloud.reconfigure();
 
 const url = `http://localhost:${HTTP_PORT}`;
-Promise.all([new Promise((r) => http!.server.once("listening", r)), osc.ready])
+Promise.all([new Promise((r) => http!.server.once("listening", r)), startOsc()])
   .then(() => {
-    console.log(`SOUND_READY ${JSON.stringify({ url, http: HTTP_PORT, osc: OSC_PORT, data: DATA_DIR, pid: process.pid })}`);
+    console.log(`SOUND_READY ${JSON.stringify({ url, http: HTTP_PORT, osc: engine.rt.osc.port, data: DATA_DIR, pid: process.pid })}`);
     if (process.argv.includes("--open")) openAppWindow(url, log);
   })
   .catch((e) => {

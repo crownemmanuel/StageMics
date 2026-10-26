@@ -86,7 +86,7 @@ export class Engine {
   private lastCue = "";
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   /** Extra work some commands need (import, detect), plugged in by main.ts. */
-  hooks: { importLiveStage?: (a: Args) => Promise<unknown>; importSources?: () => Promise<unknown>; lan?: () => { address: string; name: string }[] } = {};
+  hooks: { restartOsc?: () => Promise<void>; importLiveStage?: (a: Args) => Promise<unknown>; importSources?: () => Promise<unknown>; lan?: () => { address: string; name: string }[] } = {};
 
   constructor(show: SoundShow, settings: Settings, ev: EngineEvents, appVersion: string, readOnlyDesk: boolean) {
     this.show = show;
@@ -105,6 +105,7 @@ export class Engine {
       channels: {},
       sends: {},
       livestage: { lastAt: null, from: null, protocol: null, lastCommand: null },
+      osc: { status: "off", port: settings.network.oscPort, error: null },
       cloud: { status: "off", error: null, at: null },
       meters: null,
       meterSource: null,
@@ -523,6 +524,18 @@ export class Engine {
         if (a.newJoinKey === true || (sy.mode === "cloud" && !sy.cloud.joinKey)) sy.cloud.joinKey = joinKey();
         this.dirty.settings = true;
         return { ok: true };
+      }
+      case "settings.network": {
+        const net = this.settings.network;
+        if (a.oscPort !== undefined) {
+          const p = Math.round(n(a, "oscPort", 1024, 65535));
+          if (p === Number(process.env.SOUND_HTTP_PORT || 1450)) throw new UserError("That is the app's own web port; pick another");
+          net.oscPort = p;
+        }
+        if (a.oscEnabled !== undefined) net.oscEnabled = b(a, "oscEnabled");
+        this.dirty.settings = true;
+        this.ev.log(`network control: OSC ${net.oscEnabled ? `on UDP ${net.oscPort}` : "off"}`);
+        return this.hooks.restartOsc ? this.hooks.restartOsc().then(() => ({ ...this.rt.osc })) : { ok: true };
       }
       case "settings.remote":
         this.settings.allowRemoteOperator = b(a, "allow");

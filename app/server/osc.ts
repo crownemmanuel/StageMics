@@ -210,6 +210,10 @@ export class OscServer {
   }
 
   close() {
-    this.sock.close();
+    try {
+      this.sock.close();
+    } catch {
+      /* never bound (the port was taken) */
+    }
   }
 }
