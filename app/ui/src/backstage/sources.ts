@@ -44,14 +44,46 @@ export function localSource(): Source {
   const connect = () => {
     const sock = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?role=backstage`);
     ws = sock;
-    sock.onopen = () => b.set({ status: "synced", error: null });
-    sock.onclose = () => {
-      ws = null;
+    let heard = Date.now();
+    let dropped = false;
+    // Once per socket: it closed, or it went silent (a phone that slept, Wi-Fi that dropped without a goodbye).
+    const drop = () => {
+      if (dropped) return;
+      dropped = true;
+      clearInterval(watch);
+      if (ws === sock) ws = null;
       b.set({ status: "offline", error: "Lost the sound desk: reconnecting…" });
+      for (const [n, f] of waiting) {
+        waiting.delete(n);
+        f({ ok: false, error: "Lost the sound desk: try again in a moment" });
+      }
       setTimeout(connect, 1000);
     };
+    // The Sound app sends a heartbeat every 5 s.
+    const watch = setInterval(() => {
+      if (sock.readyState === WebSocket.OPEN && Date.now() - heard > 15000) {
+        drop();
+        try {
+          sock.close();
+        } catch {
+          /* already closing */
+        }
+      }
+    }, 2000);
+    sock.onopen = () => {
+      heard = Date.now();
+      b.set({ status: "synced", error: null });
+    };
+    sock.onclose = drop;
     sock.onmessage = (e) => {
-      const m = JSON.parse(String(e.data));
+      if (dropped) return;
+      heard = Date.now();
+      let m;
+      try {
+        m = JSON.parse(String(e.data));
+      } catch {
+        return;
+      }
       if (m.t === "backstage") b.set({ view: m.view });
       else if (m.t === "res") {
         waiting.get(m.id)?.(m);
@@ -120,6 +152,8 @@ interface Mirror {
     micCount?: number;
     activeSceneId?: string;
     nextSceneId?: string;
+    /** "m3": true = mic 3's pack is sending. */
+    signal?: Record<string, boolean>;
     scenes?: { id: string; code: string; name: string; cast?: string[] }[];
     characters?: Record<string, { name: string; gender: "male" | "female"; palette: number; defaultMic: number; thumb?: string }>;
   };
@@ -151,6 +185,7 @@ function viewOf(m: Mirror): BackstageView | null {
     micCount: s.micCount ?? 12,
     activeSceneId: s.activeSceneId || null,
     nextSceneId: s.nextSceneId || null,
+    signal: s.signal ? Object.fromEntries(Object.entries(s.signal).map(([k, v]) => [k.slice(1), v === true])) : null,
     characters: Object.entries(chars).map(([id, c]) => ({ id, name: c.name, gender: c.gender, palette: c.palette ?? 0, photo: null, thumb: c.thumb || null, defaultMic: c.defaultMic || null })),
     scenes: s.scenes.map((sc) => {
       const cast = sc.cast ?? [];

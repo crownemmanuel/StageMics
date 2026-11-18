@@ -53,6 +53,7 @@ A version with a suffix (`0.2.0-beta.1`) is published as a pre-release: apps nev
 ## How it fits together
 
 - The app is the service in `app/server` (Node). `scripts/build-sidecar.ts` bundles it with esbuild and turns it into one executable with Node's single-executable support (`src-tauri/binaries/mics-server-<target>`), which the installer puts next to the app. Homebrew's Node cannot do that step; the script then fetches the official Node build of the same version from nodejs.org (checked against its SHA-256 list) into `.cache/`.
+- `scripts/build-audio.ts` builds `stagemics-audio` (native/audio, Rust) into `src-tauri/binaries/` too; the installer puts it next to `mics-server`, which starts it to read the Dante Virtual Soundcard. `src-tauri/Info.plist` gives macOS the microphone usage text it needs for that.
 - `src-tauri/src/lib.rs` starts that executable, shows its screen (http://127.0.0.1:1450) in the window, and stops it when the app quits. If the service is already running (a previous copy, or `pnpm serve`), the window uses it.
 - `src-tauri/capabilities/default.json` lets that local screen use the updater and restart.
 - `app/ui/src/lib/updater.ts` and the dialog in `app/ui/src/main.tsx`: check, download, stop the service, install, restart; refused while a scene is active.

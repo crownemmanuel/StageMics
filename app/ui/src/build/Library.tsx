@@ -7,7 +7,7 @@ import { holderOf, micLive, presetWarnings } from "../../../server/logic.ts";
 import { AVATAR_PALETTE, type Character, type EffectPreset, type FxSend, type WatchChannel } from "../../../server/model.ts";
 import { BackstageQr } from "../show/BackstageDialog.tsx";
 import { cmd, toast, useOp } from "../lib/store.ts";
-import { Avatar, Dot, Icon, SectionLabel, cx, fmtTime } from "../lib/ui.tsx";
+import { ask, Avatar, Dot, Icon, SectionLabel, cx, fmtTime } from "../lib/ui.tsx";
 import { Card, EditText, IconBtn } from "./BuildMode.tsx";
 
 // ---------------------------------------------------------------- characters
@@ -116,7 +116,7 @@ function CharacterCard({ c }: { c: Character }) {
             Remove photo
           </button>
         )}
-        <IconBtn icon="trash" label={`Delete ${c.name}`} onClick={() => confirm(`Delete ${c.name}? They leave every scene and cue.`) && void cmd("character.remove", { id: c.id })} />
+        <IconBtn icon="trash" label={`Delete ${c.name}`} onClick={() => void ask(`Delete ${c.name}? They leave every scene and cue.`, { ok: "Delete" }).then((y) => y && cmd("character.remove", { id: c.id }))} />
       </div>
     </div>
   );
@@ -165,7 +165,7 @@ function PresetCard({ p }: { p: EffectPreset }) {
     <Card
       icon="sparkle"
       title={<EditText value={p.name} onCommit={(v) => v && save({ name: v })} ariaLabel="Effect name" className="field h-12 w-full border-transparent bg-transparent px-2 text-2xl font-black hover:border-line2" maxLength={30} />}
-      right={<IconBtn icon="trash" label={`Delete ${p.name}`} onClick={() => confirm(`Delete the effect ${p.name}? Cues that use it lose it.`) && void cmd("preset.remove", { id: p.id })} />}
+      right={<IconBtn icon="trash" label={`Delete ${p.name}`} onClick={() => void ask(`Delete the effect ${p.name}? Cues that use it lose it.`, { ok: "Delete" }).then((y) => y && cmd("preset.remove", { id: p.id }))} />}
     >
       <EditText value={p.desc} onCommit={(v) => save({ desc: v })} placeholder="Short description (Delay + hall)" ariaLabel="Description" maxLength={40} />
       {warnings.map((w) => (
@@ -301,7 +301,7 @@ export function DeskPage() {
       <Card title="Connection" right={<span className="inline-flex items-center gap-2 rounded-full bg-card px-3 py-1.5 text-[13px] font-black"><Dot color={color} size={9} />{dry ? "dry run" : rt.desk.status}</span>}>
         <div className="flex rounded-full bg-well p-1 self-start">
           {(["desk", "dry"] as const).map((m) => (
-            <button key={m} type="button" onClick={() => (m === "desk" && !confirm(`Connect to the dLive at ${d.host}? From now on cues and buttons mute and unmute its channels.`) ? null : void cmd("settings.desk", { mode: m }))} className={cx("rounded-full px-5 py-2.5 text-[15px]", d.mode === m ? "bg-text font-black text-ink" : "font-extrabold text-dim")}>
+            <button key={m} type="button" onClick={() => void (m === "desk" ? ask(`Connect to the dLive at ${d.host}? From now on cues and buttons mute and unmute its channels.`, { ok: "Connect to the desk" }) : Promise.resolve(true)).then((y) => y && cmd("settings.desk", { mode: m }))} className={cx("rounded-full px-5 py-2.5 text-[15px]", d.mode === m ? "bg-text font-black text-ink" : "font-extrabold text-dim")}>
               {m === "desk" ? "dLive desk" : "Dry run (no desk)"}
             </button>
           ))}
@@ -404,7 +404,7 @@ function AddMic() {
       {last && show.mics.length > 1 && (
         <button
           type="button"
-          onClick={() => confirm(`Remove mic ${last.n} (desk input ${last.channel})? Anyone on mic ${last.n} loses it.`) && void cmd("mics.remove", { mic: last.n }).catch((x: unknown) => setErr(x instanceof Error ? x.message : String(x)))}
+          onClick={() => void ask(`Remove mic ${last.n} (desk input ${last.channel})? Anyone on mic ${last.n} loses it.`, { ok: "Remove mic" }).then((y) => y && cmd("mics.remove", { mic: last.n }).catch((x: unknown) => setErr(x instanceof Error ? x.message : String(x))))}
           className="inline-flex items-center gap-2 rounded-[14px] border-2 border-line2 px-4 py-2 text-[15px] font-black text-soft"
         >
           <Icon name="trash" size={16} />
@@ -459,7 +459,7 @@ export function BackstagePage() {
           <div className="flex flex-wrap items-center gap-3 text-sm font-extrabold text-muted">
             <span>Join key: {c.joinKey ? `${c.joinKey.slice(0, 4)}…` : "made when cloud sync is switched on"}</span>
             {c.joinKey && (
-              <button type="button" onClick={() => confirm("Make a new join key? Phones with the old QR code lose access.") && void cmd("settings.sync", { newJoinKey: true })} className="rounded-xl bg-chip px-3 py-1.5 text-soft">
+              <button type="button" onClick={() => void ask("Make a new join key? Phones with the old QR code lose access.", { ok: "New key" }).then((y) => y && cmd("settings.sync", { newJoinKey: true }))} className="rounded-xl bg-chip px-3 py-1.5 text-soft">
                 New key
               </button>
             )}
@@ -505,6 +505,7 @@ export function SettingsPage({ onImport }: { onImport: () => void }) {
           <span className="text-sm font-extrabold text-muted">Off: only this computer can run the mics. The backstage page always works from phones.</span>
         </Card>
         <NetworkCard />
+        <ShaderCard />
         <Card title="App">
           <span className="text-[15px] font-extrabold">LiveStage Mics {appVersion}</span>
           <button type="button" onClick={() => window.dispatchEvent(new Event("mics:updates"))} className="self-start rounded-[14px] bg-chip px-4 py-2.5 text-[15px] font-black">
@@ -695,6 +696,85 @@ function NetworkCard() {
             </tbody>
           </table>
           <div className="mt-2 text-[12px] font-bold text-ghost">Text arguments are OSC strings, numbers int32. Commands set a state (never toggle), so sending one twice is safe.</div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------- Shader's video recorder
+
+const SHADER_STATE: Record<string, string> = { waiting: "waiting", saved: "saved", duplicate: "saved", skipped: "not sent", rejected: "refused" };
+const SHADER_TYPE: Record<string, string> = { "scene.enter": "Start", "scene.exit": "End", marker: "Marker" };
+
+function ShaderCard() {
+  const settings = useOp((s) => s.settings)!;
+  const sh = useOp((s) => s.runtime!.shader);
+  const c = settings.shader;
+  const [showKey, setShowKey] = useState(false);
+  const color = !c.enabled ? "#5A6273" : sh.state === "connected" ? (sh.recording ? "#B8F25C" : "#FFB547") : sh.state === "connecting" ? "#FFB547" : "#FF6B5E";
+  const line = !c.enabled
+    ? "Off"
+    : sh.state === "connected"
+      ? `${sh.app ?? "Shader"}${sh.version ? ` ${sh.version}` : ""} · ${sh.recording ? `recording “${sh.take?.name ?? "a take"}”` : "not recording"}`
+      : sh.state === "connecting"
+        ? "Connecting…"
+        : (sh.error ?? "Not answering");
+  return (
+    <Card title="Shader video recorder" right={<span className="inline-flex items-center gap-2 text-[13px] font-black" style={{ color }}><Dot color={color} />{c.enabled ? sh.state : "off"}</span>}>
+      <span className="text-sm font-extrabold text-muted">Every scene start and end (and every Mark) becomes a marker in Shader's camera recording, at the moment it happened. Markers wait on this computer until Shader has saved them.</span>
+      <label className="flex items-center gap-3 text-[15px] font-extrabold">
+        <input type="checkbox" className="size-5 accent-[#B8F25C]" checked={c.enabled} onChange={(e) => void cmd("settings.shader", { enabled: e.target.checked })} />
+        Send scene markers to Shader
+      </label>
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-[15px] font-extrabold">Computer</span>
+        <EditText value={c.host} onCommit={(v) => v && void cmd("settings.shader", { host: v })} className="field h-10 w-[170px] px-2 text-base" ariaLabel="Shader computer" placeholder="127.0.0.1" />
+        <span className="text-[15px] font-extrabold">Port</span>
+        <EditText value={String(c.port)} onCommit={(v) => void cmd("settings.shader", { port: Number(v) })} className="field h-10 w-[90px] px-2 text-center text-base" ariaLabel="Shader port" />
+      </div>
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-[15px] font-extrabold">Pairing key</span>
+        {showKey ? (
+          <EditText value={c.key} onCommit={(v) => { void cmd("settings.shader", { key: v }); setShowKey(false); }} className="field h-10 min-w-0 flex-1 px-2 font-mono text-sm" ariaLabel="Pairing key" placeholder="paste the key Shader shows" maxLength={500} />
+        ) : (
+          <button type="button" onClick={() => setShowKey(true)} className="rounded-[14px] bg-chip px-4 py-2 text-[14px] font-black">
+            {c.key ? "Change the key" : "Paste the key"}
+          </button>
+        )}
+      </div>
+      <span className="inline-flex items-center gap-2 text-[15px] font-black" style={{ color }}>
+        <Dot color={color} />
+        {line}
+      </span>
+      {c.enabled && (
+        <span className="text-sm font-extrabold text-muted">
+          {sh.pending ? `${sh.pending} marker${sh.pending === 1 ? "" : "s"} waiting for Shader. ` : ""}
+          {sh.clock ? `Clock: ${sh.clock.rttMs} ms round trip, ±${sh.clock.uncertaintyMs} ms${sh.clock.skewMs !== null && Math.abs(sh.clock.skewMs) >= 1000 ? `; the two computers' clocks differ by ${(sh.clock.skewMs / 1000).toFixed(1)} s (corrected)` : ""}.` : sh.state === "connected" ? "Shader did not answer the clock check: markers use this computer's time." : ""}
+        </span>
+      )}
+      {c.enabled && (
+        <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={() => void cmd("shader.mark", { label: "Test from StageMics" }).then((r: any) => r && toast(r.queued ? "Test marker sent to Shader" : `Not sent: ${r.reason}`, !r.queued)).catch(() => {})} className="rounded-[14px] bg-chip px-4 py-2 text-[14px] font-black">
+            Send a test marker
+          </button>
+          {sh.state === "error" && (
+            <button type="button" onClick={() => void cmd("shader.retry")} className="rounded-[14px] bg-chip px-4 py-2 text-[14px] font-black">
+              Try now
+            </button>
+          )}
+        </div>
+      )}
+      {sh.recent.length > 0 && (
+        <div className="scroll-thin flex max-h-[220px] flex-col gap-1 overflow-y-auto rounded-2xl bg-well p-3">
+          {sh.recent.map((e) => (
+            <div key={e.id} className="flex items-baseline gap-2 text-[13px]" title={e.error}>
+              <span className="w-[62px] shrink-0 font-mono text-ghost">{fmtTime(e.at)}</span>
+              <span className="w-[52px] shrink-0 font-black text-dim">{SHADER_TYPE[e.type]}</span>
+              <span className="min-w-0 flex-1 truncate font-bold text-soft">{e.label}</span>
+              <span className={cx("shrink-0 font-black", e.state === "saved" || e.state === "duplicate" ? "text-lime" : e.state === "waiting" ? "text-amber" : "text-coral")}>{SHADER_STATE[e.state]}</span>
+            </div>
+          ))}
         </div>
       )}
     </Card>

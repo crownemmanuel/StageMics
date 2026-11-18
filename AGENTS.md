@@ -6,4 +6,5 @@ StageMics runs the actors' radio mics on a real Allen & Heath dLive that is also
 - Every command goes through one handler (`app/server/engine.ts`, table in `app/server/spec.ts`). The operator screen, backstage page, OSC from LiveStage, the API and the MCP (`app/mcp.ts`) all use it: a new feature needs its command there, and an MCP tool when an agent should reach it. Mark `live` / `destructive` / `readOnly` honestly.
 - `shared/dlive.ts` and `shared/soundProtocol.ts` are shared with LiveStage (same files in both repositories): change them in both, and keep the OSC protocol compatible (bump `SOUND_PROTOCOL_VERSION` when it changes).
 - Keep show files loading: migrate in `app/server/model.ts`.
+- The Dante input and the recorder (`app/server/audio.ts`, `recorder.ts`, `native/audio`) only read audio. Try them with Build → Dante audio → Test signal (`pnpm check` does); recordings must stay repairable after a crash (see docs/APP.md).
 - Verify with `pnpm typecheck` and `pnpm check` (set `SOUND_CHECK_HTTP` / `_OSC` if its ports are taken). Ask before pushing, tagging or releasing.

@@ -102,8 +102,13 @@ export class DeskLink {
 
   private raw(bytes: number[]): boolean {
     const s = this.sock;
-    if (!s || !this.connected || s.destroyed) return false;
-    s.write(Uint8Array.from(bytes));
+    if (!s || !this.connected || s.destroyed || !s.writable) return false;
+    try {
+      s.write(Uint8Array.from(bytes));
+    } catch (e) {
+      this.h.log(`desk: could not send (${e instanceof Error ? e.message : e})`);
+      return false;
+    }
     return true;
   }
 
@@ -182,7 +187,12 @@ export class DeskLink {
         if (g === this.gen) this.open();
       }, delay);
     });
-    sock.connect(cfg.port, cfg.host);
+    try {
+      sock.connect(cfg.port, cfg.host);
+    } catch (e) {
+      // A bad address throws here instead of failing later: the error and close handlers retry as usual.
+      sock.destroy(e instanceof Error ? e : new Error(String(e)));
+    }
   }
 
   private lastError: string | null = null;

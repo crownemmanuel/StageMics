@@ -192,9 +192,14 @@ export class OscServer {
   send(address: string, args: OscArg[]) {
     const p = this.peer;
     if (!p) return;
-    this.sock.send(encodeOsc(address, args), p.port, p.address, (e) => {
-      if (e) this.log(`OSC reply to ${p.address}:${p.port}: ${e.message}`);
-    });
+    try {
+      this.sock.send(encodeOsc(address, args), p.port, p.address, (e) => {
+        if (e) this.log(`OSC reply to ${p.address}:${p.port}: ${e.message}`);
+      });
+    } catch (e) {
+      // The socket closed under us (OSC turned off or moved to another port): a reply is not worth an error.
+      this.log(`OSC reply to ${p.address}:${p.port}: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   hello() {

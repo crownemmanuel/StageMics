@@ -4,22 +4,30 @@
 //
 // Mute safety: mutes are written synchronously before anything that can wait (fades, network). Applying a
 // cue mutes first, then sets effects, then opens mics. Panic and End scene never wait on anything.
+//
+// The Dante audio input (audio.ts) and the recorder (recorder.ts) hang off the engine: they read what it
+// says is live and never write to the desk. The recorder follows every change after it is applied (flush).
+// So does the Shader link (shader.ts), which sends scene starts and ends to Shader's video recorder.
 
 import { dliveFader, dliveGetFader, dliveGetMute, dliveGetName, dliveGetSendLevel, dliveMute, dliveSendLevel, dbToLevel, levelToDb, type DliveChannel, type DliveEvent } from "../../shared/dlive.ts";
+import { AudioInput, listDevices } from "./audio.ts";
 import { DeskLink } from "./desk.ts";
+import { UserError } from "./errors.ts";
 import {
   assignMic, backstageView, castWithMics, charById, cueTargets, detectMicsFromNames, effectiveMic, effectiveMics, micLive, micSig, nextSceneFor, sceneCheckState, presetById, presetChannels, resolvePreset, resolveScene, resolveWho, sceneById, sendDb, visibleScenes,
 } from "./logic.ts";
 import {
   AVATAR_PALETTE, FX_AMOUNTS, chKey, micInput, migrateShow, sendKey, uid,
-  type Cue, type CueTrigger, type DeskStatus, type EffectPreset, type FxAmount, type FxChoice, type Runtime, type Settings, type SoundScene, type SoundShow,
+  type Cue, type CueTrigger, type DeskStatus, type EffectPreset, type FxAmount, type FxChoice, type MeterFrame, type Runtime, type Settings, type SoundScene, type SoundShow,
 } from "./model.ts";
+import { Recorder } from "./recorder.ts";
+import { ShaderLink } from "./shader.ts";
 import { SOUND_COMMANDS, type SoundCommand } from "./spec.ts";
 import { loadLive, saveLive, saveSettings, saveShow, type LiveFile } from "./store.ts";
 
 export type Source = "ui" | "backstage" | "osc" | "api" | "mcp" | "cloud" | "internal";
 
-export class UserError extends Error {}
+export { UserError };
 
 type Args = Record<string, unknown>;
 
@@ -30,6 +38,8 @@ export interface EngineEvents {
   mic(n: number, name: string, live: boolean): void;
   cue(sceneId: string, cue: number): void;
   log(msg: string): void;
+  /** Levels and the recorder's pulse, ~10 times a second while audio comes in (not part of `change`). */
+  meters(frame: MeterFrame): void;
 }
 
 interface Fade {
@@ -44,6 +54,10 @@ interface Fade {
 }
 
 const FADE_TICK_MS = 50;
+/** While a fade runs the screens hear about it this often, not on every 50 ms step. */
+const FADE_PUBLISH_MS = 200;
+/** Mutes written this long before the desk link was found dead are sent again (silence 13 s + a heartbeat). */
+const RESEND_WINDOW_MS = 20_000;
 
 // ---------------------------------------------------------------- argument checks
 
@@ -73,6 +87,9 @@ export class Engine {
   settings: Settings;
   rt: Runtime;
   desk: DeskLink;
+  audio: AudioInput;
+  rec: Recorder;
+  shader: ShaderLink;
   private ev: EngineEvents;
   private fades = new Map<string, Fade>();
   private fadeTimer: ReturnType<typeof setInterval> | null = null;
@@ -80,6 +97,11 @@ export class Engine {
   private bases: Record<string, Record<string, number>> = {};
   /** Mutes asked for while the desk link was down: sent as soon as it is back. */
   private pending = new Map<number, boolean>();
+  /**
+   * The last mute / unmute written per mic. A link that dies is only noticed after ~13 s of silence, and
+   * what was written in that time may never have reached the desk: those go out again when it is back.
+   */
+  private recent = new Map<number, { muted: boolean; at: number }>();
   private dirty = { show: false, settings: false, runtime: false };
   private flushQueued = false;
   private lastMic = new Map<number, boolean | undefined>();
@@ -111,7 +133,56 @@ export class Engine {
       meterSource: null,
       lan: [],
       appVersion,
+      audio: { status: "off", source: settings.audio.source, device: null, rate: null, channels: [], error: null, since: Date.now(), gaps: 0, silent: false },
+      signal: null,
+      rec: null!,
+      shader: null!,
     };
+    this.rec = new Recorder({
+      show: () => this.show,
+      rt: () => this.rt,
+      settings: () => this.settings,
+      log: (m) => ev.log(m),
+      changed: () => {
+        this.dirty.runtime = true;
+        this.queueFlush();
+      },
+    });
+    this.rt.rec = this.rec.st;
+    this.shader = new ShaderLink({
+      show: () => this.show,
+      rt: () => this.rt,
+      settings: () => this.settings,
+      audioAt: () => this.rec.where(),
+      version: appVersion,
+      log: (m) => ev.log(m),
+      changed: () => {
+        this.dirty.runtime = true;
+        this.queueFlush();
+      },
+    });
+    this.rt.shader = this.shader.st;
+    this.audio = new AudioInput(
+      {
+        log: (m) => ev.log(m),
+        status: (st) => {
+          this.rt.audio = st;
+          this.rt.meterSource = st.status === "running" ? (st.source === "test" ? "Test signal" : "Dante") : null;
+          if (st.status !== "running") this.rt.meters = null;
+          this.dirty.runtime = true;
+          this.queueFlush();
+        },
+        levels: (by) => this.onLevels(by),
+        signal: (by) => {
+          const next: Record<string, boolean> = {};
+          for (const m of this.show.mics) if (m.dante != null && by.has(m.dante)) next[m.n] = by.get(m.dante)!;
+          this.rt.signal = by.size ? next : null;
+          this.dirty.runtime = true;
+          this.queueFlush();
+        },
+      },
+      this.rec,
+    );
     if (live) this.bases = live.bases;
     if (keepScene) ev.log(`restored after a restart: scene ${sceneById(show, keepScene)?.code} cue ${(live?.cue ?? -1) + 1} was active (nothing re-sent to the desk)`);
     this.desk = new DeskLink(
@@ -205,8 +276,10 @@ export class Engine {
       }
       case "extras.set": {
         if (!Array.isArray(a.extras)) throw new UserError("extras must be a list of {name, channel}");
-        this.show.extras = (a.extras as Args[]).map((x) => ({ id: s(x, "id", false) || uid("ex"), name: s(x, "name").trim().slice(0, 30), channel: Math.round(n(x, "channel", 1, 128)) }));
-        if (this.show.extras.some((x) => !x.name)) throw new UserError("Every extra channel needs a name");
+        // Checked in full before anything changes: a bad entry must not leave half a list.
+        const extras = (a.extras as Args[]).map((x) => ({ id: s(x, "id", false) || uid("ex"), name: s(x, "name").trim().slice(0, 30), channel: Math.round(n(x, "channel", 1, 128)) }));
+        if (extras.some((x) => !x.name)) throw new UserError("Every extra channel needs a name");
+        this.show.extras = extras;
         if (this.desk.connected) this.askMics();
         if (this.settings.desk.mode === "dry") this.seedDry();
         this.dirty.runtime = true;
@@ -449,22 +522,29 @@ export class Engine {
         return this.touch();
       }
       case "mics.set": {
-        if (!Array.isArray(a.mics)) throw new UserError("mics must be a list of {n, channel}");
-        for (const m of a.mics as Args[]) {
-          const num = Math.round(n(m, "n", 1, this.show.mics.length));
-          const channel = Math.round(n(m, "channel", 1, 128));
-          const def = this.show.mics.find((x) => x.n === num)!;
-          def.channel = channel;
+        if (!Array.isArray(a.mics)) throw new UserError("mics must be a list of {n, channel?, dante?}");
+        // Every entry checked before any mic changes.
+        const changes = (a.mics as Args[]).map((m) => ({
+          def: this.show.mics.find((x) => x.n === Math.round(n(m, "n", 1, this.show.mics.length)))!,
+          channel: m.channel !== undefined ? Math.round(n(m, "channel", 1, 128)) : undefined,
+          dante: m.dante === undefined ? undefined : m.dante === null || m.dante === "" ? null : Math.round(n(m, "dante", 1, 512)),
+        }));
+        for (const c of changes) {
+          if (c.channel !== undefined) c.def.channel = c.channel;
+          if (c.dante !== undefined) c.def.dante = c.dante;
         }
         if (this.desk.connected) this.askMics();
+        this.configureAudio();
         this.dirty.runtime = true;
         return this.touch();
       }
       case "mics.add": {
         if (this.show.mics.length >= 32) throw new UserError("32 mics is the most the app (and the cloud backstage) handles");
         const channel = Math.round(n(a, "channel", 1, 128));
-        const mic = { n: this.show.mics.length + 1, channel };
+        const next = this.show.mics.length + 1;
+        const mic = { n: next, channel, dante: a.dante === undefined ? next : a.dante === null ? null : Math.round(n(a, "dante", 1, 512)) };
         this.show.mics.push(mic);
+        this.configureAudio();
         if (this.desk.connected) this.askMics();
         if (this.settings.desk.mode === "dry") this.seedDry();
         this.dirty.runtime = true;
@@ -482,6 +562,7 @@ export class Engine {
         for (const c of this.show.characters) if (c.defaultMic === last.n) c.defaultMic = null;
         for (const sc of this.show.scenes) for (const [id, m] of Object.entries(sc.mics)) if (m === last.n) delete sc.mics[id];
         this.show.mics.pop();
+        this.configureAudio();
         this.pending.delete(last.n);
         delete this.rt.fx[last.n];
         this.dirty.runtime = true;
@@ -503,6 +584,8 @@ export class Engine {
         this.rt.sends = {};
         this.rt.desk.host = d.host;
         this.rt.desk.port = d.port;
+        // Another desk (or dry run): what was written to the old one is not sent again to this one.
+        this.recent.clear();
         this.desk.configure(d);
         if (d.mode === "dry") this.seedDry();
         this.dirty.settings = true;
@@ -546,7 +629,145 @@ export class Engine {
         return this.hooks.importLiveStage(a);
       case "import.sources":
         return this.hooks.importSources ? this.hooks.importSources() : [];
+
+      // ---- Dante audio and the recorder
+      case "audio.devices":
+        return listDevices().catch((e: unknown) => {
+          throw new UserError(e instanceof Error ? e.message : String(e));
+        });
+      case "settings.audio": {
+        const au = this.settings.audio;
+        if (a.source !== undefined) {
+          if (a.source !== "off" && a.source !== "device" && a.source !== "test") throw new UserError("source must be off, device or test");
+          if (a.source === "off" && this.rec.recording) throw new UserError("Stop the recording before turning the Dante input off");
+          au.source = a.source;
+        }
+        if (a.device !== undefined) au.device = s(a, "device", false).slice(0, 200);
+        if (a.rate !== undefined) {
+          const r = Math.round(n(a, "rate", 0, 96000));
+          if (r !== 0 && ![44100, 48000, 88200, 96000].includes(r)) throw new UserError("rate must be 0 (the device's own), 44100, 48000, 88200 or 96000");
+          au.rate = r;
+        }
+        if (a.noSignalDb !== undefined) au.noSignalDb = Math.round(n(a, "noSignalDb", -96, -20));
+        this.dirty.settings = true;
+        this.configureAudio(a.restart === true);
+        return { ok: true };
+      }
+      case "settings.recorder": {
+        const r = this.settings.recorder;
+        if (a.folder !== undefined) {
+          if (this.rec.recording) throw new UserError("Stop the recording before changing the folder");
+          r.folder = s(a, "folder", false).trim().slice(0, 1000);
+        }
+        if (a.preRollMs !== undefined) r.preRollMs = Math.round(n(a, "preRollMs", 0, 2000));
+        if (a.postRollMs !== undefined) r.postRollMs = Math.round(n(a, "postRollMs", 0, 2000));
+        this.dirty.settings = true;
+        this.dirty.runtime = true;
+        return { ok: true, folder: this.rec.folder() };
+      }
+      case "rec.tracks": {
+        if (!Array.isArray(a.tracks)) throw new UserError("tracks must be a list of {name, dante}");
+        const tracks = (a.tracks as Args[]).map((x) => ({ id: s(x, "id", false) || uid("rt"), name: s(x, "name").trim().slice(0, 30), dante: Math.round(n(x, "dante", 1, 512)) }));
+        if (tracks.some((x) => !x.name)) throw new UserError("Every track needs a name");
+        this.show.recTracks = tracks;
+        this.configureAudio();
+        return this.touch();
+      }
+      case "rec.start":
+        return this.rec.start(s(a, "name", false).slice(0, 80) || undefined);
+      case "rec.stop":
+        return this.rec.stop();
+      case "rec.mark": {
+        const r = this.rec.mark(s(a, "label", false));
+        // The same moment goes to Shader's video recorder too.
+        if (this.settings.shader.enabled) this.shader.marker(s(a, "label", false));
+        return r;
+      }
+
+      // ---- Shader's video recorder
+      case "settings.shader": {
+        const sh = this.settings.shader;
+        if (a.host !== undefined) {
+          const h = s(a, "host").trim();
+          if (!/^[A-Za-z0-9.\-:]{1,200}$/.test(h)) throw new UserError("host must be a computer name or address, like 192.168.1.20");
+          sh.host = h;
+        }
+        if (a.port !== undefined) sh.port = Math.round(n(a, "port", 1, 65535));
+        if (a.key !== undefined) sh.key = s(a, "key", false).trim().slice(0, 500);
+        if (a.enabled !== undefined) sh.enabled = b(a, "enabled");
+        this.dirty.settings = true;
+        this.ev.log(`shader link: ${sh.enabled ? `on, ${sh.host}:${sh.port}${sh.key ? " (with key)" : " (no key)"}` : "off"}`);
+        this.shader.configure();
+        return { ok: true };
+      }
+      case "shader.status":
+        return this.shader.status();
+      case "shader.mark": {
+        if (!this.settings.shader.enabled) throw new UserError("The Shader link is off (Build → Settings → Shader video recorder)");
+        return this.shader.marker(s(a, "label", false));
+      }
+      case "shader.retry":
+        this.shader.kick();
+        return { ok: true };
+      case "rec.status":
+        return this.recStatus();
+      case "rec.sessions":
+        return this.rec.sessions();
+      case "rec.session":
+        return this.rec.sessionInfo(s(a, "session", false) || null);
+      case "rec.export": {
+        const scope = s(a, "scope", false) || "show";
+        return this.rec.export({ session: s(a, "session", false) || null, scope, by: a.by === "mic" ? "mic" : "character" });
+      }
+      case "rec.reveal":
+        return this.rec.reveal(s(a, "session", false) || null, s(a, "sub", false) || undefined);
+      case "audio.testSignal": {
+        if (this.settings.audio.source !== "test") throw new UserError("Only for the test signal (Build → Dante → Test signal)");
+        const ch = Math.round(n(a, "channel", 1, 512));
+        if (b(a, "on")) this.audio.testOff.delete(ch);
+        else this.audio.testOff.add(ch);
+        return { channel: ch, on: !this.audio.testOff.has(ch) };
+      }
     }
+  }
+
+  /** The Dante channels the show needs, from the settings: starts, restarts or stops the audio input. */
+  configureAudio(force = false) {
+    const channels = [...this.show.mics.map((m) => m.dante), ...this.show.recTracks.map((t) => t.dante)].filter((c): c is number => typeof c === "number");
+    this.audio.configure(this.settings.audio, channels, force);
+  }
+
+  private onLevels(by: Map<number, number>) {
+    if (!by.size) {
+      this.rt.meters = null;
+      return;
+    }
+    const mics: Record<string, number> = {};
+    for (const m of this.show.mics) if (m.dante != null && by.has(m.dante)) mics[m.n] = Math.round(by.get(m.dante)! * 100) / 100;
+    const tracks: Record<string, number> = {};
+    for (const t of this.show.recTracks) if (by.has(t.dante)) tracks[t.id] = Math.round(by.get(t.dante)! * 100) / 100;
+    this.rt.meters = mics;
+    this.ev.meters({ at: Date.now(), mics, tracks, rec: this.rec.pulse() });
+  }
+
+  private recStatus() {
+    const r = this.rt.rec;
+    const p = this.rec.pulse();
+    return {
+      recording: r.state === "recording",
+      session: r.session,
+      seconds: p && p.rate ? Math.round(p.pos / p.rate) : null,
+      lastWriteSecondsAgo: p && p.writeAgo !== null ? Math.round(p.writeAgo / 100) / 10 : null,
+      writingNow: r.open.map((o) => ({ track: o.name, mic: o.mic })),
+      segments: r.segments,
+      audio: { status: this.rt.audio.status, device: this.rt.audio.device, rate: this.rt.audio.rate, error: this.rt.audio.error, gaps: this.rt.audio.gaps, silent: this.rt.audio.silent || undefined },
+      diskFreeGB: r.disk ? Math.round((r.disk.free / 1024 ** 3) * 10) / 10 : null,
+      warnings: r.warnings,
+      error: r.error,
+      resumed: r.resumed,
+      exports: r.exports,
+      folder: r.folder,
+    };
   }
 
   // ---------------------------------------------------------------- lookups
@@ -605,7 +826,14 @@ export class Engine {
   // ---------------------------------------------------------------- show running
 
   private applyCue(sc: SoundScene, i: number) {
-    const targets = cueTargets(this.show, sc, i);
+    // Two cast members on one mic (a backstage mix-up): one target per mic, and the one the cue wants live
+    // wins, with its effect (otherwise the muted one's "no effect" would clear the live one's).
+    const byMic = new Map<number, ReturnType<typeof cueTargets>[number]>();
+    for (const t of cueTargets(this.show, sc, i)) {
+      const had = byMic.get(t.mic);
+      if (!had || (t.live && !had.live)) byMic.set(t.mic, t);
+    }
+    const targets = [...byMic.values()];
     const mine = new Set(targets.map((t) => t.mic));
     // Leaving another scene: its mics that this scene does not use are muted and lose their effects.
     const prev = this.activeScene();
@@ -698,6 +926,7 @@ export class Engine {
       // The desk does not echo our own changes back, so take it as done.
       st.muted = muted;
       this.pending.delete(mic);
+      this.recent.set(mic, { muted, at: Date.now() });
     } else {
       this.pending.set(mic, muted);
       this.ev.log(`desk not connected: mic ${mic} ${muted ? "mute" : "unmute"} waits for the desk`);
@@ -775,6 +1004,7 @@ export class Engine {
 
   private tickFades() {
     const now = Date.now();
+    let finished = false;
     for (const [key, f] of this.fades) {
       const k = Math.min(1, (now - f.t0) / f.dur);
       const lv = Math.round(f.start + (f.end - f.start) * k);
@@ -787,6 +1017,7 @@ export class Engine {
         }
       }
       if (k >= 1) {
+        finished = true;
         this.fades.delete(key);
         const d = this.fadeDone.get(key);
         this.fadeDone.delete(key);
@@ -797,26 +1028,49 @@ export class Engine {
       clearInterval(this.fadeTimer);
       this.fadeTimer = null;
     }
-    this.dirty.runtime = true;
-    this.queueFlush();
+    // The desk gets every step; the screens (a full state patch each) a few times a second and the last step.
+    if (finished || !this.fades.size || now - this.fadePublishedAt >= FADE_PUBLISH_MS) {
+      this.fadePublishedAt = now;
+      this.dirty.runtime = true;
+      this.queueFlush();
+    }
   }
+  private fadePublishedAt = 0;
 
+  /** Callers mark the runtime dirty (a fade only now and then, see tickFades). */
   private writeSend(from: DliveChannel, to: DliveChannel, level: number) {
     const key = sendKey(from, to);
     if (this.settings.desk.mode === "dry" || this.desk.write(dliveSendLevel(this.desk.n, from, to, level))) this.rt.sends[key] = level;
-    this.dirty.runtime = true;
   }
 
   // ---------------------------------------------------------------- the desk
 
   private onDeskStatus(st: DeskStatus, err: string | null) {
     const d = this.rt.desk;
+    if (d.status === "connected" && st !== "connected") this.requeueRecent();
     if (d.status !== st) d.since = Date.now();
     d.status = st;
     d.error = err;
     if (st !== "connected") d.queried = false;
     this.dirty.runtime = true;
     this.queueFlush();
+  }
+
+  /**
+   * The link dropped: mic changes written shortly before may have died with it (the desk is only found
+   * silent after ~13 s). They wait like any change made while the desk is away and go out again when it is
+   * back; sending a mute or unmute the desk already has changes nothing.
+   */
+  private requeueRecent() {
+    const since = Date.now() - RESEND_WINDOW_MS;
+    const again: string[] = [];
+    for (const [mic, w] of this.recent) {
+      if (w.at < since || this.pending.has(mic) || !micInput(this.show, mic)) continue;
+      this.pending.set(mic, w.muted);
+      again.push(`${mic} ${w.muted ? "mute" : "unmute"}`);
+    }
+    this.recent.clear();
+    if (again.length) this.ev.log(`desk link lost: the last mic changes (${again.join(", ")}) go out again when it is back, in case they did not arrive`);
   }
 
   private onDeskConnected() {
@@ -962,6 +1216,7 @@ export class Engine {
       this.rt.cue = -1;
     }
     if (this.desk.connected) this.askDesk();
+    this.configureAudio();
     this.touch();
     this.dirty.runtime = true;
     this.queueFlush();
@@ -981,10 +1236,13 @@ export class Engine {
       })(),
       mics: this.show.mics.map((m) => {
         const holder = sc ? castWithMics(this.show, sc).find((c) => c.mic === m.n)?.char : this.show.characters.find((c) => c.defaultMic === m.n);
-        return { mic: m.n, input: m.channel, deskName: this.rt.channels[`input:${m.channel}`]?.name, who: holder?.name, live: micLive(this.show, this.rt, m.n), fx: this.rt.fx[m.n] ? presetById(this.show, this.rt.fx[m.n].preset)?.name : undefined, waiting: this.pending.has(m.n) || undefined };
+        return { mic: m.n, input: m.channel, deskName: this.rt.channels[`input:${m.channel}`]?.name, who: holder?.name, live: micLive(this.show, this.rt, m.n), fx: this.rt.fx[m.n] ? presetById(this.show, this.rt.fx[m.n].preset)?.name : undefined, waiting: this.pending.has(m.n) || undefined, signal: this.rt.signal ? this.rt.signal[m.n] : undefined };
       }),
       livestage: this.rt.livestage,
       sync: { mode: this.settings.sync.mode, cloud: this.rt.cloud },
+      audio: { status: this.rt.audio.status, source: this.rt.audio.source, device: this.rt.audio.device, error: this.rt.audio.error, noSignal: this.rt.signal ? Object.entries(this.rt.signal).filter(([, v]) => !v).map(([k]) => Number(k)) : null },
+      shader: this.settings.shader.enabled ? { state: this.rt.shader.state, error: this.rt.shader.error, recording: this.rt.shader.recording, take: this.rt.shader.take?.name ?? null, waiting: this.rt.shader.pending } : null,
+      recording: this.rt.rec.state === "recording" ? { name: this.rt.rec.session?.name, writing: this.rt.rec.open.map((o) => o.name), warnings: this.rt.rec.warnings } : null,
       show: { name: this.show.name, scenes: this.show.scenes.length, characters: this.show.characters.length },
     };
   }
@@ -1009,34 +1267,44 @@ export class Engine {
     this.flushQueued = false;
     const d = this.dirty;
     this.dirty = { show: false, settings: false, runtime: false };
-    if (d.settings) {
+    // Each step on its own: one that throws (a full disk, a bad recorder state) must not stop the screens,
+    // LiveStage or the recorder from hearing about the change.
+    const step = (what: string, f: () => void) => {
       try {
-        saveSettings(this.settings);
+        f();
       } catch (e) {
-        this.ev.log(`could not save settings: ${e instanceof Error ? e.message : e}`);
+        this.ev.log(`${what}: ${e instanceof Error ? e.stack ?? e.message : e}`);
       }
-    }
+    };
+    if (d.settings) step("could not save settings", () => saveSettings(this.settings));
     if (d.show) this.scheduleSave();
     if (d.runtime || d.show) this.saveLiveSoon();
     // Tell LiveStage (OSC replies) about every mic that changed, whatever changed it.
-    const sc = this.activeScene() ?? this.selectedScene();
-    for (const m of this.show.mics) {
-      const live = micLive(this.show, this.rt, m.n);
-      if (this.lastMic.get(m.n) !== live) {
-        const had = this.lastMic.has(m.n);
-        this.lastMic.set(m.n, live);
-        if (had && live !== undefined) {
-          const holder = sc ? castWithMics(this.show, sc).find((c) => c.mic === m.n)?.char : undefined;
-          this.ev.mic(m.n, holder?.name ?? this.show.characters.find((c) => c.defaultMic === m.n)?.name ?? `Mic ${m.n}`, live);
+    step("telling LiveStage", () => {
+      const sc = this.activeScene() ?? this.selectedScene();
+      for (const m of this.show.mics) {
+        const live = micLive(this.show, this.rt, m.n);
+        if (this.lastMic.get(m.n) !== live) {
+          const had = this.lastMic.has(m.n);
+          this.lastMic.set(m.n, live);
+          if (had && live !== undefined) {
+            const holder = sc ? castWithMics(this.show, sc).find((c) => c.mic === m.n)?.char : undefined;
+            this.ev.mic(m.n, holder?.name ?? this.show.characters.find((c) => c.defaultMic === m.n)?.name ?? `Mic ${m.n}`, live);
+          }
         }
       }
+      const cueKey = `${this.rt.activeSceneId}:${this.rt.cue}`;
+      if (cueKey !== this.lastCue) {
+        this.lastCue = cueKey;
+        this.ev.cue(this.rt.activeSceneId ?? "", this.rt.cue + 1);
+      }
+    });
+    // The recorder follows what is now live (it may change rt.rec, which comes round in the next flush).
+    if (d.runtime || d.show) {
+      step("recorder", () => this.rec.sync());
+      step("shader link", () => this.shader.sync());
     }
-    const cueKey = `${this.rt.activeSceneId}:${this.rt.cue}`;
-    if (cueKey !== this.lastCue) {
-      this.lastCue = cueKey;
-      this.ev.cue(this.rt.activeSceneId ?? "", this.rt.cue + 1);
-    }
-    if (d.show || d.settings || d.runtime) this.ev.change(d);
+    if (d.show || d.settings || d.runtime) step("updating the screens", () => this.ev.change(d));
   }
 
   private scheduleSave() {
@@ -1068,7 +1336,11 @@ export class Engine {
     }, 500);
   }
 
-  shutdown() {
+  /** Save, close the desk link; a recording is left to carry on after the restart (its files are finished). */
+  async shutdown() {
+    this.audio.stop();
+    this.shader.stop();
+    const leaving = this.rec.recording ? this.rec.stop("interrupted") : Promise.resolve();
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveNow();
@@ -1080,6 +1352,7 @@ export class Engine {
     }
     this.desk.close();
     if (this.fadeTimer) clearInterval(this.fadeTimer);
+    await leaving;
   }
 }
 

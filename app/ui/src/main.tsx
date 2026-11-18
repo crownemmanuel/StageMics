@@ -3,15 +3,16 @@ import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BuildMode } from "./build/BuildMode.tsx";
 import { panic, useOp } from "./lib/store.ts";
-import { Icon, Pill, cx } from "./lib/ui.tsx";
+import { AskDialog, Icon, Pill, cx, fmtClock } from "./lib/ui.tsx";
+import { RecorderMode } from "./recorder/RecorderMode.tsx";
 import { BackstageDialog } from "./show/BackstageDialog.tsx";
 import { ShowMode } from "./show/ShowMode.tsx";
 import { checkForUpdate, inDesktopApp, installUpdate, startUpdateChecks, useUpdater } from "./lib/updater.ts";
 
 startUpdateChecks();
 
-type Mode = "show" | "build";
-const readMode = (): Mode => (location.hash.startsWith("#build") ? "build" : "show");
+type Mode = "show" | "recorder" | "build";
+const readMode = (): Mode => (location.hash.startsWith("#build") ? "build" : location.hash.startsWith("#recorder") ? "recorder" : "show");
 
 function App() {
   const [mode, setMode] = useState<Mode>(readMode);
@@ -30,8 +31,8 @@ function App() {
     window.addEventListener("mics:updates", f);
     return () => window.removeEventListener("mics:updates", f);
   }, []);
-  const go = (m: Mode) => {
-    location.hash = m === "build" ? "#build" : "";
+  const go = (m: Mode, page?: string) => {
+    location.hash = m === "show" ? "" : `#${m}${page ? `/${page}` : ""}`;
     setMode(m);
   };
   return (
@@ -42,15 +43,16 @@ function App() {
           <Icon name="warn" /> Not connected to the mic service: reconnecting… (MUTE ALL still tries)
         </div>
       )}
-      {ready ? mode === "show" ? <ShowMode drawer={drawer} setDrawer={setDrawer} /> : <BuildMode /> : <div className="p-10 text-xl font-extrabold text-muted">Connecting…</div>}
+      {ready ? mode === "show" ? <ShowMode drawer={drawer} setDrawer={setDrawer} /> : mode === "recorder" ? <RecorderMode /> : <BuildMode /> : <div className="p-10 text-xl font-extrabold text-muted">Connecting…</div>}
       {qr && <BackstageDialog onClose={() => setQr(false)} />}
       {updates && <UpdateDialog onClose={() => setUpdates(false)} />}
+      <AskDialog />
       <Toast />
     </div>
   );
 }
 
-function TopBar({ mode, go, openDrawer, openQr, openUpdates }: { mode: Mode; go: (m: Mode) => void; openDrawer: () => void; openQr: () => void; openUpdates: () => void }) {
+function TopBar({ mode, go, openDrawer, openQr, openUpdates }: { mode: Mode; go: (m: Mode, page?: string) => void; openDrawer: () => void; openQr: () => void; openUpdates: () => void }) {
   const up = useUpdater();
   const rt = useOp((s) => s.runtime);
   const show = useOp((s) => s.show);
@@ -84,7 +86,17 @@ function TopBar({ mode, go, openDrawer, openQr, openUpdates }: { mode: Mode; go:
         <button type="button" onClick={openQr} className="rounded-full" title={rt?.cloud.error ?? "Backstage mic check: show the QR code"}>
           <Pill color={syncColor}>{cloud ? "Cloud sync" : "Local sync"}</Pill>
         </button>
-        {rt?.meterSource && <Pill color="#B8F25C">{rt.meterSource}</Pill>}
+        {/* While recording the REC pill says it all (amber when the audio stops). */}
+        {rt && rt.audio.source !== "off" && rt.rec.state !== "recording" && (
+          <button type="button" onClick={() => go("build", "dante")} className="rounded-full" title={rt.audio.error ?? `${rt.audio.device ?? ""}${rt.audio.rate ? ` · ${rt.audio.rate / 1000} kHz` : ""}`}>
+            <Pill color={rt.audio.status === "running" ? (rt.audio.silent ? "#FFB547" : "#B8F25C") : rt.audio.status === "starting" ? "#FFB547" : "#FF6B5E"}>
+              {rt.audio.source === "test" ? "Test signal" : "Dante"}
+              {rt.audio.status === "error" ? " · offline" : rt.audio.silent ? " · silent" : ""}
+            </Pill>
+          </button>
+        )}
+        {rt?.rec.state === "recording" && <RecPill onClick={() => go("recorder")} />}
+        {rt && settings?.shader.enabled && <VideoPill onClick={() => go("build", "settings")} />}
         {up.phase === "available" && (
           <button type="button" onClick={openUpdates} className="rounded-full" title="A newer version of StageMics is published">
             <Pill color="#8FE3F5">Update {up.version}</Pill>
@@ -103,9 +115,9 @@ function TopBar({ mode, go, openDrawer, openQr, openUpdates }: { mode: Mode; go:
         <Icon name="qr" size={22} />
       </button>
       <nav aria-label="Mode" className="flex rounded-full bg-card p-1">
-        {(["show", "build"] as Mode[]).map((m) => (
-          <button key={m} type="button" onClick={() => go(m)} className={cx("rounded-full px-[22px] py-2.5 text-[15px]", mode === m ? "bg-text font-black text-ink" : "font-extrabold text-dim")}>
-            {m === "show" ? "Show" : "Build"}
+        {(["show", "recorder", "build"] as Mode[]).map((m) => (
+          <button key={m} type="button" onClick={() => go(m)} className={cx("rounded-full px-[18px] py-2.5 text-[15px]", mode === m ? "bg-text font-black text-ink" : "font-extrabold text-dim")}>
+            {m === "show" ? "Show" : m === "recorder" ? "Recorder" : "Build"}
           </button>
         ))}
       </nav>
@@ -127,6 +139,38 @@ function TopBar({ mode, go, openDrawer, openQr, openUpdates }: { mode: Mode; go:
   );
 }
 
+/** Red in the top bar while recording, with the time; amber when something needs a look. Opens the Recorder. */
+function RecPill({ onClick }: { onClick: () => void }) {
+  const rec = useOp((s) => s.runtime!.rec);
+  const pulse = useOp((s) => s.meters?.rec ?? null);
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const sec = pulse && pulse.rate ? pulse.pos / pulse.rate : rec.session ? (Date.now() - rec.session.startedAt) / 1000 : 0;
+  const trouble = rec.warnings.length > 0 || !!rec.error;
+  return (
+    <button type="button" onClick={onClick} title={trouble ? rec.warnings.join("\n") : "Recording: open the Recorder"} className="inline-flex items-center gap-2 rounded-full px-3.5 py-2 text-sm font-black" style={{ background: trouble ? "#3A2A0E" : "#3A1216", color: trouble ? "#FFD58F" : "#FF8E84" }}>
+      <span className="size-2.5 animate-pulse rounded-full" style={{ background: trouble ? "#FFB547" : "#FF4B3E" }} />
+      REC {fmtClock(sec, true)}
+    </button>
+  );
+}
+
+/** Shader's video recorder: green while it records and has every marker, amber when it is not recording or markers wait, red when it does not answer. */
+function VideoPill({ onClick }: { onClick: () => void }) {
+  const sh = useOp((s) => s.runtime!.shader);
+  const bad = sh.state === "error" || sh.state === "off";
+  const color = bad ? "#FF6B5E" : sh.state === "connecting" ? "#FFB547" : sh.recording && !sh.pending ? "#B8F25C" : "#FFB547";
+  const text = bad ? "Video · not answering" : sh.state === "connecting" ? "Video · connecting" : !sh.recording ? "Video · not recording" : sh.pending ? `Video · ${sh.pending} waiting` : "Video · REC";
+  return (
+    <button type="button" onClick={onClick} className="rounded-full" title={sh.error ?? (sh.take ? `Shader is recording “${sh.take.name ?? "a take"}”: scene markers go there` : "Shader is not recording: scene markers are not sent")}>
+      <Pill color={color}>{text}</Pill>
+    </button>
+  );
+}
+
 /** Check for updates / install one (desktop app only). Same rules as LiveStage: only on a press, never mid-scene. */
 function UpdateDialog({ onClose }: { onClose: () => void }) {
   const up = useUpdater();
@@ -134,6 +178,7 @@ function UpdateDialog({ onClose }: { onClose: () => void }) {
   const show = useOp((s) => s.show);
   const version = rt?.appVersion ?? "";
   const active = rt?.activeSceneId ? show?.scenes.find((x) => x.id === rt.activeSceneId) : null;
+  const recording = rt?.rec.state === "recording";
   useEffect(() => {
     if (inDesktopApp && up.phase !== "available" && up.phase !== "downloading" && up.phase !== "installing") void checkForUpdate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -160,7 +205,8 @@ function UpdateDialog({ onClose }: { onClose: () => void }) {
             <div className="text-[20px] font-black">Version {up.version} is ready to install</div>
             {up.notes && <div className="scroll-thin max-h-[200px] overflow-y-auto rounded-2xl bg-well p-4 text-[15px] font-bold whitespace-pre-wrap text-dim">{up.notes}</div>}
             {active && !busy && <div className="rounded-2xl bg-amber-bg px-4 py-3 text-[15px] font-black text-amber-text">Scene {active.code} is active. End the scene first: the app restarts to install.</div>}
-            <button type="button" disabled={busy || !!active} onClick={() => void installUpdate(active ? active.code : null)} className="h-14 rounded-[18px] bg-lime text-[19px] font-black text-ink disabled:opacity-50">
+            {recording && !busy && <div className="rounded-2xl bg-amber-bg px-4 py-3 text-[15px] font-black text-amber-text">The show is being recorded. Stop the recording first (Recorder).</div>}
+            <button type="button" disabled={busy || !!active || recording} onClick={() => void installUpdate(active ? active.code : null)} className="h-14 rounded-[18px] bg-lime text-[19px] font-black text-ink disabled:opacity-50">
               {up.phase === "downloading" ? `Downloading${pct !== null ? ` ${pct}%` : "…"}` : up.phase === "installing" ? "Installing and restarting…" : `Install ${up.version} and restart`}
             </button>
             <span className="text-[13px] font-extrabold text-ghost">The desk keeps every mic as it is while the app restarts (a few seconds).</span>

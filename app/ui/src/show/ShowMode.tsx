@@ -6,7 +6,7 @@ import { useRef, useState } from "react";
 import { castWithMics, holderOf, micLive, nextSceneFor, presetById, sceneById, sceneCheckState, strayMics, visibleScenes, type CheckState } from "../../../server/logic.ts";
 import { AVATAR_PALETTE, FX_AMOUNTS, type Character, type FxAmount, type Runtime, type SoundScene, type SoundShow } from "../../../server/model.ts";
 import { cmd, useOp } from "../lib/store.ts";
-import { Avatar, Icon, cx } from "../lib/ui.tsx";
+import { ask, Avatar, Icon, MeterBar, cx } from "../lib/ui.tsx";
 
 const WINDOW = 5;
 
@@ -236,6 +236,8 @@ function SceneRun({ show, rt, scene, active, pending, strays, openFx, openMusic 
         {!total && <span className="text-base font-extrabold text-ghost">No cues yet: add them in Build.</span>}
       </section>
 
+      {active && <NextSignal show={show} rt={rt} />}
+
       {strays.map((n) => {
         const who = holderOf(show, activeScene, n)?.char.name ?? `Mic ${n}`;
         return (
@@ -261,15 +263,45 @@ function SceneRun({ show, rt, scene, active, pending, strays, openFx, openMusic 
   );
 }
 
+/**
+ * While a scene is live: are the next scene's packs on? (From the Dante feed: a pack that is off sends silence.)
+ * Amber with the names when one is silent, so someone can go and check before the scene starts.
+ */
+function NextSignal({ show, rt }: { show: SoundShow; rt: Runtime }) {
+  const next = sceneById(show, nextSceneFor(show, rt));
+  if (!rt.signal || !next) return null;
+  const cast = castWithMics(show, next).filter((c) => c.mic != null && rt.signal![c.mic] !== undefined);
+  if (!cast.length) return null;
+  const silent = cast.filter((c) => rt.signal![c.mic!] === false);
+  if (!silent.length)
+    return (
+      <div className="-mt-1 inline-flex items-center gap-2 self-start rounded-full bg-lime-card px-3.5 py-1.5 text-[14px] font-black text-lime">
+        <Icon name="check" size={15} stroke={3} />
+        Next, scene {next.code}: all {cast.length} packs are sending
+      </div>
+    );
+  return (
+    <div className="flex items-center gap-3.5 rounded-[18px] bg-amber-bg py-3 pr-3 pl-[18px] text-amber-text">
+      <Icon name="warn" size={22} />
+      <span className="flex-1 text-[17px] font-black">
+        Next, scene {next.code}: no signal from {silent.map((c) => `${c.char.name} (mic ${c.mic})`).join(", ")}. Check {silent.length === 1 ? "the pack" : "the packs"} before it starts.
+      </span>
+    </div>
+  );
+}
+
 function MicCard({ show, rt, char, mic, crowded, pending, openFx }: { show: SoundShow; rt: Runtime; char: Character; mic: number | null; crowded: boolean; pending: boolean | undefined; openFx: (w: { char: Character; mic: number }) => void }) {
   const live = mic != null ? micLive(show, rt, mic) : undefined;
   const fx = mic != null ? rt.fx[mic] : undefined;
   const preset = fx ? presetById(show, fx.preset) : null;
-  const meter = mic != null && rt.meters ? rt.meters[mic] ?? 0 : null;
+  const meterRaw = useOp((s) => (mic != null && s.meters ? s.meters.mics[mic] ?? null : null));
+  const meter = mic != null && rt.meters !== null ? meterRaw : null;
+  const signal = mic != null && rt.signal ? rt.signal[mic] : undefined;
+  const recording = mic != null && rt.rec.open.some((o) => o.key === `m:${mic}`);
   let flag = "";
   if (mic == null) flag = "No mic: assign one backstage";
   else if (pending !== undefined) flag = `Waiting for the desk: ${pending ? "live" : "mute"}`;
-  else if (meter !== null && live && meter < 0.02) flag = "No signal — check pack";
+  else if (signal === false) flag = "No signal — check the pack";
   else if (meter !== null && live === false && meter > 0.3) flag = "Talking while muted";
   const on = live === true;
   const sz = crowded ? { av: 60, name: 22, pad: 14, radius: 22, gap: 10, btnPad: 11, btn: 17 } : { av: 88, name: 30, pad: 22, radius: 28, gap: 16, btnPad: 16, btn: 22 };
@@ -291,6 +323,12 @@ function MicCard({ show, rt, char, mic, crowded, pending, openFx }: { show: Soun
           </span>
           <span className="flex flex-wrap gap-1.5">
             <span className="inline-flex items-center rounded-full bg-chip px-2.5 py-1 text-[13px] font-black text-soft">{mic != null ? `MIC ${mic}` : "NO MIC"}</span>
+            {recording && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-[#3A1216] px-2.5 py-1 text-[13px] font-black text-[#FF8E84]" title="Being recorded">
+                <span className="size-2 rounded-full bg-[#FF4B3E]" />
+                REC
+              </span>
+            )}
             {preset && fx && (
               <span className="inline-flex items-center rounded-full bg-violet-bg px-2.5 py-1 text-[13px] font-black text-violet-text">
                 {preset.name}
@@ -300,11 +338,7 @@ function MicCard({ show, rt, char, mic, crowded, pending, openFx }: { show: Soun
           </span>
         </span>
       </button>
-      {meter !== null && (
-        <div className="h-2.5 overflow-hidden rounded-full bg-ink">
-          <div className="h-full rounded-full" style={{ width: `${Math.round(meter * 100)}%`, background: on ? "#B8F25C" : "#5A6273" }} />
-        </div>
-      )}
+      {mic != null && rt.meters !== null && <MeterBar value={meter ?? 0} on={on} />}
       {flag && (
         <div className="flex items-center gap-2 rounded-[14px] bg-amber-bg px-3 py-[9px] text-sm font-black text-[#FFC970]">
           <Icon name="warn" size={17} />
@@ -322,13 +356,17 @@ const UNITY = 0x6b;
 const faderDb = (lv: number) => (lv <= 0 ? "−∞" : `${Math.round((lv / 127) * 64 - 54)}`);
 
 /**
- * The mic's desk fader, upright beside the card. Shows what the desk reports; dragging sends the new level
- * (about 15 times a second, then the final one on release). Double-click / double-tap: back to 0 dB.
+ * The mic's desk fader, upright beside the card. Shows what the desk reports; dragging moves it from where it
+ * is (a tap, or a press that does not move, changes nothing: a stray touch on a live mic must not jump its
+ * level), sending the new level about 15 times a second and the final one on release. Double-click /
+ * double-tap: back to 0 dB.
  */
 function Fader({ name, level, live, narrow, onSend }: { name: string; level: number | undefined; live: boolean; narrow: boolean; onSend: (db: number | null) => void }) {
   const [drag, setDrag] = useState<number | null>(null);
   const track = useRef<HTMLDivElement>(null);
   const lastSent = useRef(0);
+  /** Where the press started and the level then; `moved` once it went past a few pixels. */
+  const grab = useRef<{ y: number; level: number; moved: boolean } | null>(null);
   const shown = drag ?? level;
   const known = shown !== undefined;
   const send = (lv: number, final: boolean) => {
@@ -338,9 +376,9 @@ function Fader({ name, level, live, narrow, onSend }: { name: string; level: num
     onSend(lv <= 0 ? null : (lv / 127) * 64 - 54);
   };
   const at = (clientY: number) => {
-    const r = track.current!.getBoundingClientRect();
-    const f = 1 - (clientY - r.top) / r.height;
-    let lv = Math.round(Math.max(0, Math.min(1, f)) * 127);
+    const g = grab.current!;
+    const h = track.current!.getBoundingClientRect().height || 1;
+    let lv = Math.round(Math.max(0, Math.min(127, g.level + ((g.y - clientY) / h) * 127)));
     if (Math.abs(lv - UNITY) <= 2) lv = UNITY; // a light detent at 0 dB
     return lv;
   };
@@ -366,23 +404,28 @@ function Fader({ name, level, live, narrow, onSend }: { name: string; level: num
         onPointerDown={(e) => {
           if (!known) return;
           e.currentTarget.setPointerCapture(e.pointerId);
-          const lv = at(e.clientY);
-          setDrag(lv);
-          send(lv, false);
+          grab.current = { y: e.clientY, level: shown!, moved: false };
+          setDrag(shown!);
         }}
         onPointerMove={(e) => {
-          if (drag === null) return;
+          const g = grab.current;
+          if (!g) return;
+          if (!g.moved && Math.abs(e.clientY - g.y) < 4) return;
+          g.moved = true;
           const lv = at(e.clientY);
           setDrag(lv);
           send(lv, false);
         }}
         onPointerUp={(e) => {
-          if (drag === null) return;
-          const lv = at(e.clientY);
-          send(lv, true);
+          const g = grab.current;
+          if (g?.moved) send(at(e.clientY), true);
+          grab.current = null;
           setDrag(null);
         }}
-        onPointerCancel={() => setDrag(null)}
+        onPointerCancel={() => {
+          grab.current = null;
+          setDrag(null);
+        }}
         onDoubleClick={() => known && send(UNITY, true)}
         onKeyDown={(e) => {
           if (!known) return;
@@ -562,7 +605,7 @@ function MusicPanel({ show, rt, onClose }: { show: SoundShow; rt: Runtime; onClo
                       <span className="truncate text-[28px] leading-[1.05] font-black">{x.name}</span>
                       <span className="truncate text-[13px] font-black text-ghost">In {x.channel}{st?.name ? ` · ${st.name}` : ""}</span>
                     </span>
-                    <button type="button" onClick={() => confirm(`Remove ${x.name} from the music panel? (The desk is not changed.)`) && save(show.extras.filter((e) => e.id !== x.id))} aria-label={`Remove ${x.name}`} className="inline-flex size-9 items-center justify-center rounded-xl text-ghost">
+                    <button type="button" onClick={() => void ask(`Remove ${x.name} from the music panel? (The desk is not changed.)`, { ok: "Remove" }).then((y) => y && save(show.extras.filter((e) => e.id !== x.id)))} aria-label={`Remove ${x.name}`} className="inline-flex size-9 items-center justify-center rounded-xl text-ghost">
                       <Icon name="trash" size={18} />
                     </button>
                   </div>

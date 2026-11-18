@@ -21,6 +21,14 @@ Out of the box it talks to the **Allen & Heath dLive**. Using a different desk? 
 - Import the scenes from [LiveStage](https://github.com/crownemmanuel/livestage) (or add your own), pick each scene's cast, and write its cues in a grid (who is on in each cue, which effect, and whether the cue is fired by hand or by LiveStage).
 - Characters with photos (or a placeholder face), effect presets, and the mic list: which desk input each mic is on, with the desk's own channel names read from the desk. Add more mics when you buy more packs.
 
+**Dante audio and the recorder**
+
+- Feed the mics to the computer with Dante Virtual Soundcard and StageMics shows each pack's **signal**: a pack that is off says "No signal — check the pack" on the operator's card and on the crew's phones, and while a scene runs it warns if anyone in the **next** scene is silent.
+- **Record the show**: one track per character, written only while their mic is live, so a muted actor is silence, and Mary stays on Mary's track when she changes packs between scenes.
+- **Export** for the video editor: one WAV per person as long as the whole show (or per scene), all starting together, with markers. Look at the Recorder tab any time to see it is still writing.
+- Crash-safe: it records in finished chunks, repairs what was being written if the computer stops, and carries on with the same recording when the app is back.
+- **Scene markers in the video**: every scene start and end goes to Shader's camera recorder as a marker at the moment it happened, kept and retried until Shader has saved it.
+
 **Backstage mic check** (the crew's phones)
 
 - Scan the QR code. The phone shows the **next** scene's cast with their mic numbers. If a pack was swapped, tap the number and pick the new one. Tap **All good**.
@@ -38,7 +46,7 @@ Windows and macOS (Apple silicon): download the installer from [Releases](https:
 - **Windows**: the installer is not code-signed yet. If you see "Windows protected your PC", choose *More info → Run anyway*. Allow StageMics on private networks when Windows asks (phones and LiveStage reach it over the network).
 - **macOS**: not notarized yet. After dragging it to Applications, run `xattr -cr "/Applications/StageMics.app"` once.
 
-Then **Build → Desk**: the desk's network address, its MIDI channel, and choose **dLive desk** (until then it runs in *dry run* and sends nothing).
+Then **Build → Desk**: the desk's network address, its MIDI channel, and choose **dLive desk** (until then it runs in *dry run* and sends nothing). For signal alerts and recording, **Build → Dante audio** (install Dante Virtual Soundcard first; see [docs/APP.md](docs/APP.md#dante-audio-and-the-recorder)).
 
 ## Make it work with your desk
 
@@ -122,8 +130,10 @@ pnpm install
 pnpm dev          # the desktop app (Tauri)
 pnpm serve        # the service only: http://localhost:1450
 pnpm fake-dlive   # a pretend dLive on 127.0.0.1:51325 (Build → Desk → address 127.0.0.1)
-pnpm check        # end-to-end test against its own pretend desk
+pnpm fake-shader  # a pretend Shader video recorder on port 9202 (prints the scene markers it gets)
+pnpm check        # end-to-end test against its own pretend desk (and a test Dante signal)
 pnpm typecheck
+pnpm build:audio  # the Dante capture helper (Rust; needs cargo)
 ```
 
 How it is put together: [docs/APP.md](docs/APP.md). Releases and the updater: [docs/RELEASES.md](docs/RELEASES.md). Notes for AI agents working on the code: [AGENTS.md](AGENTS.md).

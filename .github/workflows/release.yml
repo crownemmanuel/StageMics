@@ -138,7 +138,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: |
+            src-tauri -> target
+            native/audio -> target
 
       - run: pnpm install --frozen-lockfile
 

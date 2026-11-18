@@ -5,6 +5,7 @@
 //   show.json      the show: mics, characters, scenes with cast / mic assignments / cues, effect presets
 //   settings.json  this computer: desk address, sync mode, cloud keys
 // Runtime state (what is live, effects applied, what the desk reports) is not part of either.
+// Recordings have their own files (session.json per recording, see app/server/recorder.ts).
 
 import type { DliveChannel, DliveKind } from "../../shared/dlive.ts";
 
@@ -32,10 +33,20 @@ export interface Character {
   defaultMic: number | null;
 }
 
-/** Mic n (1-based) is the desk input `channel`. */
+/** Mic n (1-based) is the desk input `channel`, and reaches this computer on Dante Virtual Soundcard channel `dante`. */
 export interface MicDef {
   n: number;
   channel: number;
+  /** 1-based channel of the Dante input device (meters, signal checks, the recorder); null: not on Dante. */
+  dante: number | null;
+}
+
+/** A channel the recorder always records while it runs (a reference mix, audience mics), whatever the mutes say. */
+export interface RecTrack {
+  id: string;
+  name: string;
+  /** 1-based channel of the Dante input device. */
+  dante: number;
 }
 
 export interface FxChoice {
@@ -124,6 +135,8 @@ export interface SoundShow {
   presets: EffectPreset[];
   /** Desk inputs that are not actors' mics but the operator needs all show long (Dante music players…). */
   extras: ExtraChannel[];
+  /** Dante channels the recorder records the whole time (not gated by mutes). */
+  recTracks: RecTrack[];
   source: ShowSource | null;
   updatedAt: number;
 }
@@ -175,6 +188,38 @@ export interface Settings {
   allowRemoteOperator: boolean;
   /** Network control: OSC commands (LiveStage, a lighting console, Companion…) on this UDP port. */
   network: { oscEnabled: boolean; oscPort: number };
+  audio: AudioSettings;
+  recorder: RecorderSettings;
+  /** Scene markers to Shader's video recorder (docs/APP.md, "Shader video recorder"). */
+  shader: ShaderSettings;
+}
+
+export interface ShaderSettings {
+  enabled: boolean;
+  /** The computer running Shader (127.0.0.1 = this one) and its recorder port. */
+  host: string;
+  port: number;
+  /** The pairing key Shader shows: sent as a Bearer token, never logged. */
+  key: string;
+}
+
+/** "device": an audio input of this computer (the Dante Virtual Soundcard); "test": a built-in test signal. */
+export type AudioSourceKind = "off" | "device" | "test";
+export interface AudioSettings {
+  source: AudioSourceKind;
+  /** Input device name as this computer shows it, e.g. "Dante Virtual Soundcard". */
+  device: string;
+  /** Sample rate to ask for; 0 = whatever the device runs at (never changes the Dante clock). */
+  rate: number;
+  /** A mic whose level stays below this (dBFS) for 2 s has "no signal": pack off, dead battery, out of range. */
+  noSignalDb: number;
+}
+export interface RecorderSettings {
+  /** Where recordings go; "" = "StageMics Recordings" in the home folder. */
+  folder: string;
+  /** Kept from before an unmute and after a mute, so the first and last syllable survive (ms). */
+  preRollMs: number;
+  postRollMs: number;
 }
 
 // ---------------------------------------------------------------- runtime (not saved in the show)
@@ -209,16 +254,176 @@ export interface Runtime {
   /** The OSC listener as it is now. */
   osc: { status: "off" | "listening" | "error"; port: number; error: string | null };
   cloud: { status: "off" | "connecting" | "live" | "error"; error: string | null; at: number | null };
-  /** Signal meters per mic (0–1). Null until a meter source (e.g. a Dante feed) is plugged in. */
+  /** Signal meters per mic (0–1, −60…0 dBFS). Null until a meter source (the Dante feed) runs. Not broadcast with the rest: screens get them ~10 times a second as `meters` messages. */
   meters: Record<string, number> | null;
   meterSource: string | null;
   lan: { address: string; name: string }[];
   appVersion: string;
+  /** The Dante (or test) audio input. */
+  audio: AudioStatus;
+  /** Per mic number: true = signal, false = below the no-signal level for 2 s. Null while no audio comes in. */
+  signal: Record<string, boolean> | null;
+  rec: RecStatus;
+  shader: ShaderStatus;
+}
+
+/** One marker event as the screens see it. */
+export interface ShaderEventInfo {
+  id: string;
+  type: "scene.enter" | "scene.exit" | "marker";
+  label: string;
+  at: number;
+  /** waiting: in the outbox; skipped: Shader was not recording; rejected: Shader refused it (error says why). */
+  state: "waiting" | "saved" | "duplicate" | "skipped" | "rejected";
+  error?: string;
+}
+
+/** The link to Shader's video recorder. */
+export interface ShaderStatus {
+  state: "off" | "connecting" | "connected" | "error";
+  target: string;
+  error: string | null;
+  app: string | null;
+  version: string | null;
+  /** Shader's take, as of its last answer. */
+  recording: boolean | null;
+  take: { id: string; name: string | null; startedUtc: number | null } | null;
+  /** Events waiting to be saved by Shader. */
+  pending: number;
+  /** Round trip and the two clocks' difference (Shader − this computer) from the best probe. */
+  clock: { rttMs: number; uncertaintyMs: number; skewMs: number | null; at: number } | null;
+  lastContact: number | null;
+  recent: ShaderEventInfo[];
+}
+
+export interface AudioStatus {
+  status: "off" | "starting" | "running" | "error";
+  source: AudioSourceKind;
+  device: string | null;
+  rate: number | null;
+  /** Dante channels being read. */
+  channels: number[];
+  error: string | null;
+  since: number;
+  /** Times audio was lost (the computer was too slow to read it, or the device restarted). */
+  gaps: number;
+  /** Every channel is pure digital silence: Dante Virtual Soundcard stopped, or no microphone permission. */
+  silent: boolean;
+}
+
+export interface RecExport {
+  id: string;
+  session: string;
+  label: string;
+  state: "running" | "done" | "error";
+  /** 0–1 */
+  progress: number;
+  folder: string;
+  /** `folder` inside the recording's folder ("Export/Full show"), for rec.reveal. */
+  sub: string;
+  files: number;
+  error: string | null;
+  at: number;
+}
+
+/** The recorder as the screens see it. Positions are in samples of the recording's timeline. */
+export interface RecStatus {
+  state: "idle" | "recording";
+  /** The recording being made, else the last one. */
+  session: { id: string; name: string; folder: string; startedAt: number; rate: number } | null;
+  /** Who is being written right now. */
+  open: { key: string; track: string; name: string; mic: number | null; since: number }[];
+  /** Bumped whenever segments, scenes or markers change: the Recorder tab then fetches rec.session. */
+  rev: number;
+  segments: number;
+  error: string | null;
+  warnings: string[];
+  /** The recording carried on after the app restarted (or the audio came back). */
+  resumed: { at: number; lostSeconds: number } | null;
+  disk: { free: number; total: number } | null;
+  exports: RecExport[];
+  folder: string;
+}
+
+/** ~10 times a second to operator screens: levels and the recorder's pulse. */
+export interface MeterFrame {
+  at: number;
+  /** Per mic number, 0–1 (−60…0 dBFS peak). */
+  mics: Record<string, number>;
+  /** Per always-recorded track id. */
+  tracks: Record<string, number>;
+  /** `writeAgo`: ms since the last write reached the disk (measured on the service, so any screen's clock is fine). */
+  rec: { pos: number; rate: number; bytes: number; writeAgo: number | null } | null;
+}
+
+// ---------------------------------------------------------------- recordings (session.json)
+
+export interface RecTrackInfo {
+  id: string;
+  kind: "character" | "mic" | "always";
+  name: string;
+  charId?: string;
+  mic?: number;
+}
+/** One stretch of one mic, written while it was live (one mono 24-bit WAV in segments/). */
+export interface RecSegment {
+  id: number;
+  file: string;
+  /** RecTrackInfo id: "char:<id>", "mic:<n>" (nobody in the scene had it) or "rec:<id>" (always recorded). */
+  track: string;
+  mic: number | null;
+  dante: number;
+  /** First sample on the recording's timeline. */
+  start: number;
+  length: number;
+  open: boolean;
+  scene: string | null;
+  /** Closed after a crash from what was on disk. */
+  recovered?: boolean;
+}
+export interface RecSceneRun {
+  scene: string;
+  code: string;
+  name: string;
+  start: number;
+  end: number | null;
+}
+export interface RecMarker {
+  at: number;
+  kind: "cue" | "mark" | "gap";
+  label: string;
+}
+export interface RecSession {
+  version: number;
+  id: string;
+  name: string;
+  showId: string;
+  showName: string;
+  startedAt: number;
+  stoppedAt: number | null;
+  updatedAt: number;
+  /** "interrupted": the app stopped while recording (crash, quit); its files were closed from what was on disk. */
+  state: "recording" | "stopped" | "interrupted";
+  /** 0 until the first audio arrives. */
+  rate: number;
+  /** Timeline length in samples. */
+  length: number;
+  /** Each time audio (re)started: where on the timeline. */
+  runs: { offset: number; at: number; source: string }[];
+  tracks: Record<string, RecTrackInfo>;
+  segments: RecSegment[];
+  scenes: RecSceneRun[];
+  markers: RecMarker[];
+  nextSegment: number;
+  preRollMs: number;
+  postRollMs: number;
 }
 
 /** What the backstage page gets: no settings, no desk internals. */
 export interface BackstageView {
   showName: string;
+  /** Per mic number: is the pack sending (from the Dante feed)? Null when the sound desk has no audio feed. */
+  signal: Record<string, boolean> | null;
   /** `mics`: every cast member's mic in that scene (defaults filled in). */
   scenes: { id: string; code: string; name: string; cast: string[]; mics: Record<string, number>; micsAt: number; checked: SceneCheck | null }[];
   characters: { id: string; name: string; gender: Gender; palette: number; photo: string | null; thumb: string | null; defaultMic: number | null }[];
@@ -258,7 +463,7 @@ export const AVATAR_PALETTE: { bg: string; robe: string; hair: string }[] = [
 ];
 
 export function defaultMics(): MicDef[] {
-  return Array.from({ length: MIC_COUNT }, (_, i) => ({ n: i + 1, channel: 77 + i }));
+  return Array.from({ length: MIC_COUNT }, (_, i) => ({ n: i + 1, channel: 77 + i, dante: i + 1 }));
 }
 
 export function defaultPresets(): EffectPreset[] {
@@ -296,6 +501,9 @@ export function defaultSettings(): Settings {
     },
     allowRemoteOperator: false,
     network: { oscEnabled: true, oscPort: 1451 },
+    audio: { source: "off", device: "", rate: 0, noSignalDb: -70 },
+    recorder: { folder: "", preRollMs: 100, postRollMs: 250 },
+    shader: { enabled: false, host: "127.0.0.1", port: 9202, key: "" },
   };
 }
 
@@ -345,7 +553,7 @@ export function demoShow(): SoundShow {
   const scenes: SoundScene[] = raw.map(([code, name, cast, cues], i) => ({
     id: `demo_${code.replace(".", "_")}`, code, name, order: i + 1, group: null, source: "demo", removed: false, cast: cast.map(c), mics: {}, micsAt: 0, cues, checked: null,
   }));
-  return { version: SHOW_VERSION, showId: uid("sshow"), name: "Demo show", mics: defaultMics(), characters, scenes, presets: defaultPresets(), extras: [], source: null, updatedAt: Date.now() };
+  return { version: SHOW_VERSION, showId: uid("sshow"), name: "Demo show", mics: defaultMics(), characters, scenes, presets: defaultPresets(), extras: [], recTracks: [], source: null, updatedAt: Date.now() };
 }
 
 // ---------------------------------------------------------------- migrations
@@ -362,9 +570,13 @@ export function migrateShow(raw: unknown): SoundShow {
   const v = num(r.version, 1);
   if (v > SHOW_VERSION) throw new Error(`This show file is from a newer StageMics (format ${v}); update the app`);
   // Version 1 is the first format. Future migrations go here: if (v < 2) { …; }
-  const mics = arr(r.mics).map((m) => ({ n: num(obj(m).n, 0), channel: num(obj(m).channel, 0) })).filter((m) => m.n >= 1 && m.channel >= 1 && m.channel <= 128);
+  // `dante` came later: a file without it gets mic n on Dante channel n.
+  const dante = (v: unknown, n: number) => (v === null ? null : typeof v === "number" && v >= 1 && v <= 512 ? Math.round(v) : n);
+  const mics = arr(r.mics).map((m) => ({ n: num(obj(m).n, 0), channel: num(obj(m).channel, 0), dante: dante(obj(m).dante, num(obj(m).n, 0)) })).filter((m) => m.n >= 1 && m.channel >= 1 && m.channel <= 128);
   const byN = new Map(mics.map((m) => [m.n, m]));
   const fullMics = defaultMics().map((d) => byN.get(d.n) ?? d);
+  // Mics added after the first 12 (Build → Desk → Add mic), as long as the numbers carry on without a hole.
+  for (let k = MIC_COUNT + 1; byN.has(k) && k <= 32; k++) fullMics.push(byN.get(k)!);
   const characters: Character[] = arr(r.characters).map((x, i) => {
     const c = obj(x);
     return {
@@ -440,6 +652,9 @@ export function migrateShow(raw: unknown): SoundShow {
     extras: arr(r.extras)
       .map((x) => ({ id: str(obj(x).id) || uid("ex"), name: str(obj(x).name).slice(0, 30), channel: num(obj(x).channel, 0) }))
       .filter((x) => x.name && x.channel >= 1 && x.channel <= 128),
+    recTracks: arr(r.recTracks)
+      .map((x) => ({ id: str(obj(x).id) || uid("rt"), name: str(obj(x).name).slice(0, 30), dante: Math.round(num(obj(x).dante, 0)) }))
+      .filter((x) => x.name && x.dante >= 1 && x.dante <= 512),
     source: src.kind === "livestage" ? { kind: "livestage", showName: str(src.showName), via: str(src.via), importedAt: num(src.importedAt, 0) } : null,
     updatedAt: num(r.updatedAt, Date.now()),
   };
@@ -452,12 +667,18 @@ export function migrateSettings(raw: unknown): Settings {
   if (v > SETTINGS_VERSION) throw new Error(`settings.json is from a newer StageMics (format ${v})`);
   const desk = obj(r.desk);
   const sync = obj(r.sync);
+  const audio = obj(r.audio);
+  const rec = obj(r.recorder);
+  const ms = (v: unknown, dflt: number) => Math.max(0, Math.min(2000, Math.round(num(v, dflt))));
   const cloud = obj(sync.cloud);
   return {
     version: SETTINGS_VERSION,
     desk: {
       host: str(desk.host, d.desk.host).trim() || d.desk.host,
-      port: Math.round(num(desk.port, d.desk.port)),
+      port: (() => {
+        const p = Math.round(num(desk.port, d.desk.port));
+        return p >= 1 && p <= 65535 ? p : d.desk.port;
+      })(),
       baseChannel: Math.max(1, Math.min(12, Math.round(num(desk.baseChannel, d.desk.baseChannel)))),
       mode: desk.mode === "desk" ? "desk" : "dry",
     },
@@ -482,6 +703,22 @@ export function migrateSettings(raw: unknown): Settings {
         const p = Math.round(num(obj(r.network).oscPort, d.network.oscPort));
         return p >= 1024 && p <= 65535 ? p : d.network.oscPort;
       })(),
+    },
+    audio: {
+      source: audio.source === "device" || audio.source === "test" ? audio.source : "off",
+      device: str(audio.device).slice(0, 200),
+      rate: [44100, 48000, 88200, 96000].includes(num(audio.rate, 0)) ? num(audio.rate, 0) : 0,
+      noSignalDb: Math.max(-96, Math.min(-20, num(audio.noSignalDb, d.audio.noSignalDb))),
+    },
+    recorder: { folder: str(rec.folder).slice(0, 1000), preRollMs: ms(rec.preRollMs, d.recorder.preRollMs), postRollMs: ms(rec.postRollMs, d.recorder.postRollMs) },
+    shader: {
+      enabled: obj(r.shader).enabled === true,
+      host: str(obj(r.shader).host, d.shader.host).trim().slice(0, 200) || d.shader.host,
+      port: (() => {
+        const p = Math.round(num(obj(r.shader).port, d.shader.port));
+        return p >= 1 && p <= 65535 ? p : d.shader.port;
+      })(),
+      key: str(obj(r.shader).key).trim().slice(0, 500),
     },
   };
 }

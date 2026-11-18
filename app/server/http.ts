@@ -28,6 +28,10 @@ const TYPES: Record<string, string> = {
 
 type Role = "operator" | "backstage";
 
+/** Every screen gets this at least this often (state, meters or a bare heartbeat), so it can tell a dead link. */
+const HEARTBEAT_MS = 5000;
+const HEARTBEAT = JSON.stringify({ t: "hb" });
+
 export interface LogBook {
   lines: { at: number; msg: string }[];
 }
@@ -176,12 +180,18 @@ export function startHttp(engine: Engine, port: number, logBook: LogBook, log: (
     wss.handleUpgrade(req, socket, head, (ws) => {
       clients.set(ws, role);
       const alive = { ok: true };
+      let beats = 0;
       ws.on("pong", () => (alive.ok = true));
       const ping = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        // Pages cannot see pings: this lets a screen notice a service that froze or a link that died silently.
+        ws.send(HEARTBEAT);
+        // A ping every other beat (10 s); no pong by the next one and the socket is dropped.
+        if (++beats % 2) return;
         if (!alive.ok) return ws.terminate();
         alive.ok = false;
         ws.ping();
-      }, 10000);
+      }, HEARTBEAT_MS);
       ws.on("close", () => {
         clients.delete(ws);
         clearInterval(ping);
@@ -204,6 +214,18 @@ export function startHttp(engine: Engine, port: number, logBook: LogBook, log: (
   });
 
   let lastBackstage = "";
+  let backstageInputs = "";
+  /**
+   * The phones' view comes from the show and a few runtime fields only. Building it (character thumbnails
+   * included) for every runtime change, many a second during fades and while audio runs, is wasted work.
+   */
+  function backstageChanged(showChanged: boolean): boolean {
+    const rt = engine.rt;
+    const inputs = JSON.stringify([rt.signal, rt.activeSceneId, rt.nextSceneId, rt.nextPinned]);
+    if (!showChanged && inputs === backstageInputs) return false;
+    backstageInputs = inputs;
+    return true;
+  }
   /** Engine changed: tell every screen what it needs. */
   function broadcast(what: { show: boolean; settings: boolean; runtime: boolean }) {
     const op: Record<string, unknown> = { t: "patch" };
@@ -219,7 +241,7 @@ export function startHttp(engine: Engine, port: number, logBook: LogBook, log: (
     }
     const opMsg = JSON.stringify(op);
     let bsMsg: string | null = null;
-    if (what.show || what.runtime) {
+    if ((what.show || what.runtime) && backstageChanged(what.show)) {
       const view = JSON.stringify(engine.backstage());
       if (view !== lastBackstage) {
         lastBackstage = view;
@@ -228,9 +250,21 @@ export function startHttp(engine: Engine, port: number, logBook: LogBook, log: (
     }
     for (const [ws, role] of clients) {
       if (ws.readyState !== WebSocket.OPEN) continue;
+      // A screen that stopped reading (a sleeping laptop) is dropped instead of piling up state for it;
+      // it reconnects and gets the whole state again.
+      if (ws.bufferedAmount > 8 * 1024 * 1024) {
+        ws.terminate();
+        continue;
+      }
       if (role === "operator") ws.send(opMsg);
       else if (bsMsg) ws.send(bsMsg);
     }
+  }
+
+  /** Levels and the recorder's pulse (~10 Hz): operator screens only, never with the state patches. */
+  function sendMeters(frame: unknown) {
+    const msg = JSON.stringify({ t: "meters", frame });
+    for (const [ws, role] of clients) if (role === "operator" && ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 256 * 1024) ws.send(msg);
   }
 
   function sendLog(line: { at: number; msg: string }) {
@@ -248,6 +282,7 @@ export function startHttp(engine: Engine, port: number, logBook: LogBook, log: (
   return {
     server,
     broadcast,
+    sendMeters,
     sendLog,
     links,
     close() {
@@ -277,7 +312,9 @@ function sendFile(res: ServerResponse, file: string, cache: string) {
     return notFound(res);
   }
   res.writeHead(200, { "Content-Type": TYPES[extname(file).toLowerCase()] ?? "application/octet-stream", "Cache-Control": cache });
-  createReadStream(file).pipe(res);
+  const stream = createReadStream(file);
+  stream.on("error", () => res.destroy());
+  stream.pipe(res);
 }
 
 function readJson(req: IncomingMessage, limit: number): Promise<unknown> {

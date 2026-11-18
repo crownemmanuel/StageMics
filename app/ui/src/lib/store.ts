@@ -2,7 +2,7 @@
 // while the socket is down goes over HTTP instead, so MUTE ALL never depends on the socket.
 
 import { useSyncExternalStore } from "react";
-import type { Runtime, Settings, SoundShow } from "../../../server/model.ts";
+import type { MeterFrame, Runtime, Settings, SoundShow } from "../../../server/model.ts";
 
 export interface Links {
   ip: string;
@@ -21,9 +21,11 @@ export interface OpState {
   links: Links | null;
   log: { at: number; msg: string }[];
   toast: { text: string; bad: boolean; at: number } | null;
+  /** Levels and the recorder's pulse, ~10 a second while the Dante input runs (null when it does not). */
+  meters: MeterFrame | null;
 }
 
-let state: OpState = { connected: false, show: null, runtime: null, pending: {}, settings: null, links: null, log: [], toast: null };
+let state: OpState = { connected: false, show: null, runtime: null, pending: {}, settings: null, links: null, log: [], toast: null, meters: null };
 const subs = new Set<() => void>();
 const set = (patch: Partial<OpState>) => {
   state = { ...state, ...patch };
@@ -45,12 +47,20 @@ let ws: WebSocket | null = null;
 let nextId = 1;
 const waiting = new Map<number, { ok: (v: unknown) => void; fail: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 
+/** The service sends something at least every 5 s (a heartbeat when nothing else): silence this long means it is gone. */
+const SILENT_MS = 15000;
+let lastHeard = 0;
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const sock = new WebSocket(`${proto}://${location.host}/ws?role=operator`);
   ws = sock;
-  sock.onopen = () => set({ connected: true });
-  sock.onclose = () => {
+  let dropped = false;
+  // Once per socket, whether it closed or the watchdog gave up on it.
+  const drop = () => {
+    if (dropped) return;
+    dropped = true;
+    clearInterval(watch);
     if (ws === sock) ws = null;
     set({ connected: false });
     for (const [id, w] of waiting) {
@@ -60,8 +70,32 @@ function connect() {
     }
     setTimeout(connect, 800);
   };
+  // A frozen service or a dead link can leave the socket "open" for minutes: the screen must say so.
+  const watch = setInterval(() => {
+    if (sock.readyState === WebSocket.OPEN && Date.now() - lastHeard > SILENT_MS) {
+      drop();
+      try {
+        sock.close();
+      } catch {
+        /* already closing */
+      }
+    }
+  }, 2000);
+  sock.onopen = () => {
+    lastHeard = Date.now();
+    set({ connected: true });
+  };
+  sock.onclose = drop;
   sock.onmessage = (e) => {
-    const m = JSON.parse(String(e.data));
+    if (dropped) return;
+    lastHeard = Date.now();
+    let m;
+    try {
+      m = JSON.parse(String(e.data));
+    } catch {
+      return;
+    }
+    if (m.t === "hb") return;
     if (m.t === "state") set({ show: m.show, runtime: m.runtime, pending: m.pending ?? {}, settings: m.settings, links: m.links, log: m.log ?? [] });
     else if (m.t === "patch") {
       const p: Partial<OpState> = {};
@@ -70,8 +104,11 @@ function connect() {
       if (m.pending) p.pending = m.pending;
       if (m.settings) p.settings = m.settings;
       if (m.links) p.links = m.links;
+      // The input stopped: its last levels must not stay on screen.
+      if (m.runtime && m.runtime.audio.status !== "running" && state.meters) p.meters = null;
       set(p);
-    } else if (m.t === "log") set({ log: [...state.log.slice(-150), m.line] });
+    } else if (m.t === "meters") set({ meters: m.frame });
+    else if (m.t === "log") set({ log: [...state.log.slice(-150), m.line] });
     else if (m.t === "res") {
       const w = waiting.get(m.id);
       if (!w) return;
@@ -103,7 +140,7 @@ function rawCmd(name: string, args: Record<string, unknown>): Promise<unknown> {
       const timer = setTimeout(() => {
         waiting.delete(id);
         fail(new Error(`${name}: no answer from the Sound service`));
-      }, name === "mics.detect" || name === "import.livestage" ? 20000 : 6000);
+      }, name === "mics.detect" || name === "import.livestage" || name === "audio.devices" || name === "rec.stop" ? 20000 : 6000);
       waiting.set(id, { ok, fail, timer });
       sock.send(JSON.stringify({ t: "cmd", id, cmd: name, args }));
     });

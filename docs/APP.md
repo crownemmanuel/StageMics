@@ -1,6 +1,6 @@
 # StageMics
 
-A small show-control app for the actors' radio mics. It owns the connection to the Allen & Heath dLive and mutes / unmutes the drama mics scene by scene and cue by cue, puts "voice effects" on them (sends into the desk's FX units), and gives the crew a phone page for the backstage mic check. LiveStage (the LED-wall app) drives it over OSC; an agent can drive it over MCP.
+A small show-control app for the actors' radio mics. It owns the connection to the Allen & Heath dLive and mutes / unmutes the drama mics scene by scene and cue by cue, puts "voice effects" on them (sends into the desk's FX units), and gives the crew a phone page for the backstage mic check. With the mics' audio coming in over Dante it also shows each pack's signal, warns when the next scene's packs are silent, and records the show as one track per character. LiveStage (the LED-wall app) drives it over OSC; an agent can drive it over MCP.
 
 It is deliberately light and separate from LiveStage: a Node service (`app/server/`) and two small React pages (`app/ui/`, built to `app/dist/`), shipped as a Tauri desktop app for Windows and macOS that runs the service next to itself ([RELEASES.md](RELEASES.md)). Nothing from LiveStage's UI, no Three.js.
 
@@ -16,6 +16,7 @@ pnpm ui:build       # build the screens into app/dist/
 pnpm check          # end-to-end test against the pretend desk (never touches a real desk)
 pnpm fake-dlive     # a pretend dLive on 127.0.0.1:51325 (see below)
 pnpm mcp            # the MCP server (an agent starts it; see "Agents")
+pnpm build:audio    # the Dante capture helper (native/audio, Rust); pnpm dev builds it too
 ```
 
 The desktop app starts the service and quits it with the window. If a service is already answering on port 1450 (for example `pnpm serve`), the window uses that one instead.
@@ -46,6 +47,7 @@ SIGTERM / SIGINT save the show and the live state and close every socket. A port
 | 1450 TCP | operator screen `/`, backstage page `/backstage`, JSON API `/api/…`, WebSocket `/ws` |
 | 1451 UDP | OSC commands from LiveStage |
 | 1452 TCP | `pnpm ui:dev` only |
+| 9202 TCP (out) | Shader's video recorder, when the link is on (StageMics is the client; host and port in Build → Settings) |
 
 The service listens on every interface so phones on the LAN reach `/backstage`. The operator screen, its WebSocket and the API answer **only this computer** (a LAN visitor to `/` is sent to `/backstage`) unless Build → Settings → "Allow the operator screen from other computers" is ticked. The backstage page can only assign mics and confirm scenes. Requests from a web page on another origin are refused.
 
@@ -56,7 +58,10 @@ In the data folder, every write is a temp file + rename:
 - `show.json`: mics → desk inputs, characters, scenes (cast, per-scene mic assignment, cues), effect presets. Versioned (`version`), migrated on load (`migrateShow` in `app/server/model.ts`); a file that cannot be read is kept as `show.json.broken-<time>` and the app starts from the demo show.
 - `settings.json`: this computer's desk address, sync mode, cloud keys.
 - `live.json`: the active scene / cue / effects and the send levels effects took over, so a restart shows where the show was. Nothing is re-sent to the desk on start.
+- `shader-link.json`: the Shader link's outbox (scene markers Shader has not saved yet), the scene it last reported and its recent markers, so a restart neither loses nor repeats one.
 - `photos/`: character photos. `sound.log`: the log (also on Build → Settings).
+
+Recordings live apart from the data folder, in **StageMics Recordings** in the home folder unless Recorder → Recorder settings names another (an external SSD is a good place): see [Dante audio and the recorder](#dante-audio-and-the-recorder).
 
 A first start seeds a demo show (the mock-up's cast and scenes). **Import from LiveStage** is the real path.
 
@@ -66,7 +71,7 @@ A first start seeds a demo show (the mock-up's cast and scenes). **Import from L
 
 What a card shows is what the **desk** reports: if someone mutes a channel on the surface, the card follows. While the desk link is down the screen says so, and mic changes wait and go out the moment it is back.
 
-There is a slot for signal meters (`runtime.meters`, `Engine.setMeters(source, {mic: 0–1})`), e.g. a future Dante feed. With no meter source nothing that needs audio is shown.
+With the Dante input running (Build → Dante audio), each card has a level meter, a **REC** tag while the mic is being recorded, and "No signal — check the pack" when its pack sends nothing. While a scene is live, a line under the cues says whether the **next** scene's packs are all sending, or names the silent ones in amber so someone can check them before it starts. The backstage phones show "NO SIGNAL · CHECK PACK" or "● SENDING" next to each person. The top bar shows **Dante** (lime: audio coming in) and, while recording, a red **REC 0:42:13** pill (amber when something needs a look) that opens the Recorder. With no Dante input nothing that needs audio is shown.
 
 **Build mode**: the scene's cast (add / remove), the cue grid (rows = cues, columns = cast, ON / OFF cells, effect and trigger columns, add / reorder / delete), characters (name, male / female placeholder, photo upload, default mic, colour), effect presets, desk mics + connection, backstage sync with the QR code, settings + log, and **Import scenes from LiveStage**.
 
@@ -79,6 +84,70 @@ There is a slot for signal meters (`runtime.meters`, `Engine.setMeters(source, {
 - Effects: each preset is a list of sends from the mic's channel into FX sends at a dB level, with fade in / out. Amount: Light −10 dB, Medium as set, Full +6 dB (clamped to +10). Fades step the send level about 20 times a second. Clearing puts each send back to the level it had before the effect took it (remembered, also across a restart; −∞ if unknown).
 - On connect the app asks the desk (read-only) for the names and mutes of the 12 mic inputs, and the names / mutes / faders of the FX sends, returns and DCAs the presets use, and the send levels. Build → Effect presets warns when a return is at −∞ or a DCA is muted (on the show desk FX return 3 "DELAY" was parked at −∞ and DCA 10 "FX" muted: the effect is then silent).
 - **Dry run** (the default on a fresh install): nothing is sent; the screen plays the desk. Switch to "dLive desk" in Build → Desk.
+
+## Dante audio and the recorder
+
+### The input
+
+The mics' audio reaches this computer through **Dante Virtual Soundcard** (DVS): the dLive's Dante card sends the radio mics, Dante Controller routes them to this computer, and DVS shows them as an ordinary audio input (Core Audio on a Mac, WDM on Windows). StageMics only listens: nothing in this section ever writes to the desk.
+
+1. Install DVS and start it with at least as many channels as there are mics, at 48 kHz.
+2. On the dLive, patch each radio mic to a Dante output from its **input socket / preamp** (or a direct out that does not follow the mute), so StageMics hears a pack while it is muted. The recorder does the muting itself.
+3. In Dante Controller, route those outputs to this computer's DVS channels, in mic order if possible.
+4. Build → **Dante audio**: choose *Dante Virtual Soundcard*, pick the device, and set each mic's Dante channel (default: mic n on channel n; "Number them in order" from any first channel). Leave one empty for a mic that is not on Dante.
+
+The sample rate is whatever DVS runs at (StageMics never changes the Dante clock). **Test signal** is a pretend feed (a tone per channel that comes and goes like speech) for trying everything without a desk; "pack off" on a mic makes it silent. On a Mac the app needs microphone access (System Settings → Privacy & Security → Microphone; the installed app has the usage text). An unsigned build may ask again after an update. When every channel is pure digital silence the Dante page says so (DVS stopped, or no permission).
+
+How it reads the device: `stagemics-audio` (native/audio, Rust with cpal) ships next to `mics-server` and is started by it with the Dante channels it needs. It copies them out of the audio callback into a lock-free ring (about 5 s) and streams them to the service over stdout. If it stops (DVS restarted, device unplugged) or nothing arrives for 2 s, the service starts it again with back-off (1 s … 10 s). Lost audio is counted, never hidden.
+
+**No signal**: a mic whose level stays below −70 dBFS (Build → Dante audio → No signal) for 2 s has no signal. A receiver whose pack is off sends digital silence; a pack that is on sends at least room noise.
+
+**Always recorded**: channels the recorder keeps the whole time, whatever the mutes (a reference mix for the editor, audience mics). Build → Dante audio → Always recorded.
+
+### Recording
+
+Recorder tab → **Record**. The rules:
+
+- One track per **character**, for the whole recording. A mic is written only while it is live, as the desk reports it (cues, buttons, OSC, someone on the surface: all the same); muted time is silence.
+- The audio goes to whoever wears that mic in the live scene, so when Mary moves from pack 1 to pack 3 between scenes her audio stays on Mary's track. A mic that is live with nobody in the scene's cast on it (a stray, or no scene active) goes to a "Mic n" track.
+- 100 ms before an unmute and 250 ms after a mute are kept (Recorder settings), so the first and last syllable survive a late mute. Opened again within those 250 ms, the same stretch just carries on.
+- On disk a recording is made of **segments**: one mono 24-bit WAV per stretch of one mic, from when it opens to when it is muted, the scene changes or the person on it changes. Each is finished (sizes written, synced) as it closes; open ones get their sizes written every 2 s and are synced every 6 s, and `session.json` (what is where on the timeline) is replaced atomically on every change.
+- The **Recorder** tab says at a glance whether it is working: the time, *Recording: 3 tracks going to disk · last write 0.2 s ago* (or exactly what is wrong), who is being written right now, a lane per track showing where there is sound, the disk space, and warnings (no audio coming in, a slow disk, low space, mics without a Dante channel). **Mark** drops a marker the editor sees.
+- **A recording only ends when you press Stop.** If the app stops while recording (crash, power, quit), the open segments are repaired from what is on disk at the next start, and if that is within 10 minutes the recording carries on on the same timeline, with silence (and a marker) for the time it was away. Older ones are just closed ("closed after a stop"). The same goes for the audio stopping mid-show: the recording waits and goes on when it is back, placed by the clock.
+- The app does not install an update while recording.
+
+The timeline is in samples of the Dante feed from when Record was pressed, so every track is sample-aligned with every other. After the input restarts, the new stretch is placed by the computer's clock.
+
+### Export (for the video editor)
+
+On a recording in the Recorder tab:
+
+- **Export full show**: one WAV per person, every one exactly as long as the recording, silent where their mic was muted. They all start together: put them at the same point on the timeline.
+- **Every scene**, or **One scene…**: the same, cut to each time a scene was live (a scene run twice gives "take 1", "take 2"). Only that scene's people.
+- *One file per radio mic instead*: one file per mic, whoever wore it.
+
+Files are mono 24-bit Broadcast WAVs whose time stamp is the time of day they start (for syncing to camera timecode). Where a track goes from silence to sound or back there is a 10 ms fade, so nothing clicks. Each folder has `markers.csv` (scenes, cues, marks, gaps with times) and `About these files.txt`. You can export while recording: scenes that have ended are complete.
+
+```
+StageMics Recordings/2026-10-26 19.02 Joseph/
+  session.json              tracks, segments (start, length in samples), scenes, markers
+  segments/0007 Mary (mic 3).wav …
+  Export/Full show/01 Mary.wav, 02 Joseph.wav … markers.csv, About these files.txt
+  Export/Scene 7 - Gabriel at the Well/…
+```
+
+A WAV holds about 8 hours of mono 24-bit at 48 kHz; export scenes for anything longer.
+
+## Shader video recorder
+
+Shader (the camera app, `~/Documents/Projects/shader`) records the cameras. StageMics sends it a marker at every **scene start** and **scene end**, and at every **Mark** (Recorder tab, or Build → Settings → Send a test marker), so the video editor finds each scene in the footage. The contract both apps follow is Shader's `docs/stagemics-markers.md`; the sender is `app/server/shader.ts`, and `pnpm fake-shader` is a pretend Shader to try it with.
+
+- **Turn it on** in Build → Settings → Shader video recorder: the Shader computer (`127.0.0.1` when it is this one), its port (9202) and the pairing key Shader shows. A **Video** light in the top bar then says *REC* (Shader is recording and has every marker), *not recording*, *N waiting* or *not answering*.
+- **HTTP JSON**, StageMics is the client. Every 2 s it asks `GET /recorder/v1/session` (the heartbeat: which take is recording), measures the clocks with `POST /recorder/v1/clock/probe`, and posts each marker to `POST /recorder/v1/sessions/<take>/events`, one at a time in order.
+- **Each marker** has a fixed id, the time it happened on this computer's clock and the measured offset to Shader's clock (so it lands on the right frame even when the two computers' clocks disagree), the scene's id, number and name, the cue and the cast with their mics, and the position in StageMics' own Dante recording when one is running. Going straight to the next scene sends the old scene's end, then the new scene's start, at the same moment.
+- **Nothing is lost or doubled**: markers are written to `shader-link.json` before they are sent and retried, byte for byte, until Shader answers saved or duplicate. A restart in the middle of a scene does not send it again.
+- **A marker belongs to the take that was recording when it happened**, never to a later one. While Shader is not recording, scene changes are not sent (the card lists them as *not sent*). When a take starts in the middle of a scene, Shader gets that scene with its real, earlier start time (`alreadyLive`).
+- It only reads what is live: nothing here reaches the desk.
 
 ## Desk setup
 
@@ -174,6 +243,15 @@ Then in Build → Backstage → Cloud set Project `demo-sls`, any API key (e.g. 
 | `mic` | live | One mic live or muted |
 | `fx` | live | Voice effect on one mic |
 | `panic` | live, destructive | Mute every mic |
+| `recorder_status` | read-only | Recording? Still writing (seconds since the last write), who is being written, the Dante input, disk space, warnings, exports |
+| `start_recording` | | Start recording the show |
+| `stop_recording` | destructive | Stop the recording (files kept) |
+| `mark_recording` | | A marker at this moment |
+| `list_recordings` | read-only | Recordings with length, tracks, scenes |
+| `export_recording` | | Export one file per person: the show, every scene, or one scene |
+| `audio_devices` | read-only | Audio inputs on this computer |
+| `video_recorder_status` | read-only | The Shader link: connected, recording which take, markers waiting, the last markers and what happened to each |
+| `mark_video` | | A marker in Shader's video recording at this moment |
 
 ## JSON API
 
@@ -194,7 +272,8 @@ Every command (`app/server/spec.ts`) goes through `Engine.run()` in `app/server/
 
 - A fresh install starts in **dry run**: nothing reaches a console until someone chooses "dLive desk" (and confirms the address).
 - The app only ever writes mutes of the 12 mic inputs and send levels from those inputs into the presets' FX sends. It never sends faders, names, colours or scene recalls.
-- Everything else it sends is a question (names, mutes, faders, send levels), including a heartbeat every 4 s that notices a dead link within ~13 s and reconnects with backoff (0.5 s … 10 s).
+- The Dante input, the signal alerts and the recorder only read audio; they never send anything to the desk.
+- Everything else it sends is a question (names, mutes, faders, send levels), including a heartbeat every 4 s that notices a dead link within ~13 s and reconnects with backoff (0.5 s … 10 s). Mutes and unmutes written in the 20 s before a link was found dead may not have arrived, so they wait ("Waiting for the desk") and go out again when it is back.
 - `SOUND_DESK_READONLY=1` lets you look at a live desk with only questions going out (mutes and sends are logged, not sent).
 - The desk is shared with church services: the dLive's own scenes may change channel names or mutes; the app shows what the desk reports and does not fight it.
 
@@ -211,8 +290,12 @@ Every command (`app/server/spec.ts`) goes through `Engine.run()` in `app/server/
 | `app/server/http.ts` | static files, API, uploads, WebSocket, access rules |
 | `app/server/importer.ts` | LiveStage show files, packages, the agent bridge; merge |
 | `app/server/cloud.ts` | Realtime Database mirror (REST + SSE) |
+| `app/server/audio.ts` | the Dante input: the helper's packets, the test signal, restarts, meters, no-signal |
+| `app/server/recorder.ts` | the recorder: gating by mutes, segments, crash repair and carrying on, export |
+| `app/server/wav.ts` | mono 24-bit Broadcast WAV writing, size patching, repair |
+| `native/audio/`, `scripts/build-audio.ts` | `stagemics-audio`, the capture helper (Rust, cpal), and its build into `src-tauri/binaries/` |
 | `app/server/main.ts`, `args.ts`, `window.ts`, `store.ts` | wiring, options, app window, files |
-| `app/ui/` | operator app (`index.html`) and backstage page (`backstage.html`) |
+| `app/ui/` | operator app (`index.html`: Show, Recorder, Build) and backstage page (`backstage.html`) |
 | `app/mcp.ts`, `app/check.ts` | MCP server, end-to-end check |
 | `src-tauri/`, `scripts/build-sidecar.ts`, `scripts/release.ts`, `.github/workflows/release.yml` | the desktop app, the service executable, releases and updates ([RELEASES.md](RELEASES.md)) |
 | `scripts/fake-dlive.ts` | the pretend desk |

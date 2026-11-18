@@ -82,6 +82,7 @@ const engine = new Engine(
     },
     mic: (n, name, live) => osc?.mic(n, name, live),
     cue: (sceneId, cue) => osc?.cue(sceneId, cue),
+    meters: (frame) => http?.sendMeters(frame),
     log,
   },
   VERSION,
@@ -158,6 +159,12 @@ async function startOsc() {
 engine.hooks.restartOsc = startOsc;
 cloud = new CloudSync(engine, log);
 cloud.reconfigure();
+// Recordings a crash left open are closed (and the newest carried on) before the Dante input starts.
+void engine.rec
+  .init()
+  .catch((e) => log(`recorder: ${e instanceof Error ? e.message : e}`))
+  .finally(() => engine.configureAudio());
+engine.shader.configure();
 
 const url = `http://localhost:${HTTP_PORT}`;
 Promise.all([new Promise((r) => http!.server.once("listening", r)), startOsc()])
@@ -178,10 +185,11 @@ function shutdown() {
   stopping = true;
   log("stopping");
   cloud?.stop();
-  engine.shutdown();
+  // The desktop app waits 3 s before it kills the service: finish the recording's files well within that.
+  const done = Promise.race([engine.shutdown(), new Promise((r) => setTimeout(r, 2000))]);
   osc?.close();
   http?.close();
-  setTimeout(() => process.exit(0), 300).unref();
+  void done.finally(() => setTimeout(() => process.exit(0), 100));
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

@@ -44,6 +44,15 @@ export const SOUND_TOOLS: Record<string, Tool> = {
   set_next_scene: { command: "scene.next", params: { scene: { type: ["string", "null"], description: "Scene id, code or name; null = follow the running order again." } }, required: ["scene"], description: "Tell backstage which scene to mic-check next; their phones move to it." },
   ask_recheck: { command: "scene.recheck", params: { scene }, required: ["scene"], description: "Clear a scene's backstage mic check so the crew checks it again." },
   panic: { live: true, destructive: true, command: "panic", params: {}, description: "MUTE ALL: mute every mic at once." },
+  recorder_status: { readOnly: true, command: "rec.status", params: {}, description: "The show recorder: is it recording and still writing to disk (seconds since the last write), who is being written right now, the Dante input, disk space, warnings, exports in progress." },
+  start_recording: { command: "rec.start", params: { name: { type: "string", description: "Name for the recording (default: the show name and time)." } }, description: "Start recording the show: one track per character, written only while their mic is live on the desk; muted time stays silent." },
+  stop_recording: { destructive: true, command: "rec.stop", params: {}, description: "Stop the recording. Its files are finished and kept. Do not use during a show unless the operator asked." },
+  mark_recording: { command: "rec.mark", params: { label: { type: "string", description: "What happened (e.g. 'Mary's mic rubbing')." } }, description: "Put a marker in the recording now; it shows in the export's markers.csv for the video editor." },
+  list_recordings: { readOnly: true, command: "rec.sessions", params: {}, description: "Recordings on this computer: id, name, length, who has a track, which scenes ran when." },
+  video_recorder_status: { readOnly: true, command: "shader.status", params: {}, description: "The link to Shader's video recorder: connected or not, whether Shader is recording (which take), scene markers still waiting to be saved, and the last markers with what happened to each (saved, duplicate, waiting, skipped because Shader was not recording, rejected)." },
+  mark_video: { command: "shader.mark", params: { label: { type: "string", description: "What happened (e.g. 'Lights failed')." } }, description: "Put a marker in Shader's video recording at this moment (scene starts and ends are sent on their own)." },
+  export_recording: { command: "rec.export", params: { session: { type: "string", description: "Recording id (default: the current or last one)." }, scope: { type: "string", description: "show (the whole recording), scenes (each scene separately), or one scene's id / code." }, by: { enum: ["character", "mic"], description: "One file per character (default) or per radio mic." } }, required: ["scope"], description: "Make the video editor's files: one WAV per person covering the whole range, silent where their mic was muted, all starting together. Runs in the background; see recorder_status." },
+  audio_devices: { readOnly: true, command: "audio.devices", params: {}, description: "Audio inputs on this computer (the Dante Virtual Soundcard should be one) with channel counts." },
 };
 
 async function api(command: string, args: Json): Promise<unknown> {
@@ -66,6 +75,8 @@ const mcp = new Server(
       "Runs the actors' radio mics on the Allen & Heath dLive through the StageMics app.",
       "Call `status` first. Tools marked [LIVE] change what the audience hears: during a show, only use them when the operator asked. `panic` mutes every mic.",
       "Mic state in `status` is what the desk reports (someone on the desk surface may have changed it).",
+      "The recorder (recorder_status, start_recording, export_recording) only reads the Dante feed; it never changes what the audience hears.",
+      "Scene starts and ends go to Shader's video recorder on their own (video_recorder_status shows whether they arrive).",
     ].join("\n"),
   },
 );

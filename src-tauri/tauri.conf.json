@@ -5,8 +5,8 @@
   "identifier": "org.salvation.stagemics",
   "build": {
     "frontendDist": "../app/shell",
-    "beforeDevCommand": "pnpm ui:build && node scripts/build-sidecar.ts",
-    "beforeBuildCommand": "pnpm ui:build && node scripts/build-sidecar.ts"
+    "beforeDevCommand": "pnpm ui:build && node scripts/build-sidecar.ts && node scripts/build-audio.ts",
+    "beforeBuildCommand": "pnpm ui:build && node scripts/build-sidecar.ts && node scripts/build-audio.ts"
   },
   "app": {
     "windows": [
@@ -34,7 +34,7 @@
     "category": "Music",
     "shortDescription": "Scene-by-scene radio-mic control for the Allen & Heath dLive",
     "createUpdaterArtifacts": true,
-    "externalBin": ["binaries/mics-server"],
+    "externalBin": ["binaries/mics-server", "binaries/stagemics-audio"],
     "resources": { "../app/dist/": "dist/" },
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
   },

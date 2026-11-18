@@ -16,5 +16,5 @@
     "verbatimModuleSyntax": true,
     "types": ["node", "vite/client"]
   },
-  "include": ["server", "ui/src", "ui/vite.config.ts", "mcp.ts", "check.ts", "../shared", "../scripts/fake-dlive.ts"]
+  "include": ["server", "ui/src", "ui/vite.config.ts", "mcp.ts", "check.ts", "../shared", "../scripts/fake-dlive.ts", "../scripts/fake-shader.ts"]
 }

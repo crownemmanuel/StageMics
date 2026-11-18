@@ -1,0 +1,20 @@
+[package]
+name = "stagemics-audio"
+version = "0.1.0"
+description = "StageMics audio capture helper: reads channels of an audio device (Dante Virtual Soundcard) and streams them to the StageMics service"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[[bin]]
+name = "stagemics-audio"
+path = "src/main.rs"
+
+[dependencies]
+cpal = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

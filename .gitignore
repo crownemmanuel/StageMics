@@ -4,6 +4,7 @@ app/dist/
 /build/
 .cache/
 src-tauri/target/
+native/audio/target/
 src-tauri/gen/
 src-tauri/binaries/
 .DS_Store

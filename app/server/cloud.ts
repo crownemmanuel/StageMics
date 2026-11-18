@@ -13,6 +13,11 @@ import { backstageView, effectiveMics, sceneById } from "./logic.ts";
 import type { CloudSettings } from "./model.ts";
 import { saveSettings } from "./store.ts";
 
+/** A request to Firebase that takes longer than this has hung (a dead mobile hotspot): give up and retry. */
+const REQUEST_TIMEOUT_MS = 15_000;
+/** The database sends a keep-alive about every 30 s: nothing for this long means the stream is dead. */
+const STREAM_IDLE_MS = 75_000;
+
 interface Remote {
   assign?: Record<string, Record<string, number>>;
   stamp?: Record<string, number>;
@@ -122,7 +127,7 @@ export class CloudSync {
     const c = this.cfg;
     const ep = authEndpoints(c);
     if (c.refreshToken) {
-      const r = await fetch(ep.refresh, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(c.refreshToken)}` });
+      const r = await fetch(ep.refresh, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(c.refreshToken)}`, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (r.ok) {
         const j = (await r.json()) as { id_token: string; refresh_token: string; user_id: string };
         this.idToken = j.id_token;
@@ -136,7 +141,7 @@ export class CloudSync {
       }
       this.log(`cloud: token refresh failed (${r.status}); signing in again`);
     }
-    const r = await fetch(ep.signUp, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ returnSecureToken: true }) });
+    const r = await fetch(ep.signUp, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ returnSecureToken: true }), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     if (!r.ok) throw new Error(`Anonymous sign-in failed (${r.status}): enable Anonymous sign-in in Firebase Authentication. ${(await r.text()).slice(0, 200)}`);
     const j = (await r.json()) as { idToken: string; refreshToken: string; localId: string };
     this.idToken = j.idToken;
@@ -154,7 +159,7 @@ export class CloudSync {
 
   private async req(method: "PUT" | "PATCH" | "GET", path: string, body?: unknown): Promise<unknown> {
     const t = await this.token();
-    const r = await fetch(this.url(path, t), { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const r = await fetch(this.url(path, t), { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     const text = await r.text();
     if (!r.ok) throw new Error(`${method} ${path.split("/").slice(3).join("/") || "show"}: ${r.status} ${text.slice(0, 160)}`);
     return text ? JSON.parse(text) : null;
@@ -177,6 +182,8 @@ export class CloudSync {
       micCount: v.micCount,
       activeSceneId: v.activeSceneId ?? "",
       nextSceneId: v.nextSceneId ?? "",
+      // "m3" keys: the database would turn numbered keys into an array.
+      signal: v.signal ? Object.fromEntries(Object.entries(v.signal).map(([k, x]) => [`m${k}`, x])) : null,
       scenes: v.scenes.map((s) => ({ id: s.id, code: s.code, name: s.name, cast: s.cast })),
       characters: Object.fromEntries(v.characters.map((c) => [c.id, { name: c.name, gender: c.gender, palette: c.palette, defaultMic: c.defaultMic ?? 0, thumb: c.thumb ?? "" }])),
     };
@@ -228,18 +235,25 @@ export class CloudSync {
     while (g === this.gen) {
       const ctl = new AbortController();
       this.abort = ctl;
+      // A stream that goes quiet (Wi-Fi gone without a goodbye) would otherwise look "live" for ever.
+      let heard = Date.now();
+      const idle = setInterval(() => {
+        if (Date.now() - heard > STREAM_IDLE_MS) ctl.abort(new Error(`nothing from the database for ${STREAM_IDLE_MS / 1000} s`));
+      }, 5000);
       try {
         const t = await this.token();
         const r = await fetch(this.url(`${this.base}/backstage`, t), { headers: { Accept: "text/event-stream" }, signal: ctl.signal });
         if (!r.ok || !r.body) throw new Error(`stream ${r.status}`);
         this.engine.setCloudStatus("live", null);
         this.retry = 0;
+        heard = Date.now();
         const reader = r.body.getReader();
         const dec = new TextDecoder();
         let buf = "";
         for (;;) {
           const { value, done } = await reader.read();
           if (done) break;
+          heard = Date.now();
           buf += dec.decode(value, { stream: true });
           let i: number;
           while ((i = buf.indexOf("\n\n")) >= 0) {
@@ -261,8 +275,14 @@ export class CloudSync {
         }
       } catch (e) {
         if (g !== this.gen) return;
-        const msg = e instanceof Error ? e.message : String(e);
+        const why = ctl.signal.aborted && ctl.signal.reason instanceof Error ? ctl.signal.reason : e;
+        const msg = why instanceof Error ? why.message : String(why);
         if (msg !== "token expired") this.engine.setCloudStatus("error", `Stream lost: ${msg}`);
+      } finally {
+        clearInterval(idle);
+        // A stream that ended without an error (a token refresh, the server closing) is closed for good.
+        if (this.abort === ctl) this.abort = null;
+        if (!ctl.signal.aborted) ctl.abort();
       }
       if (g !== this.gen) return;
       await new Promise((r) => setTimeout(r, Math.min(15000, 1000 * 2 ** this.retry++)));

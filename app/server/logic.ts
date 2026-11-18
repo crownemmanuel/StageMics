@@ -207,6 +207,7 @@ export function nextSceneFor(show: SoundShow, rt: Runtime | null): string | null
 export function backstageView(show: SoundShow, rt: Runtime | null): BackstageView {
   return {
     showName: show.name,
+    signal: rt?.signal ?? null,
     scenes: visibleScenes(show)
       .filter((s) => !s.removed && s.cast.length)
       .map((s) => ({ id: s.id, code: s.code, name: s.name, cast: s.cast, mics: effectiveMics(show, s), micsAt: s.micsAt, checked: s.checked })),

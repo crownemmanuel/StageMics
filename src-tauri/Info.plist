@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- The recorder and the signal meters read the Dante Virtual Soundcard, which macOS treats as a microphone. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>StageMics reads the Dante Virtual Soundcard to show each radio mic's signal and to record the show.</string>
+</dict>
+</plist>

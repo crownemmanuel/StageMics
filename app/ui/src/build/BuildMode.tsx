@@ -5,15 +5,29 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { castWithMics, charById, micClashes, presetById, visibleScenes } from "../../../server/logic.ts";
 import { FX_AMOUNTS, type Cue, type SoundScene, type SoundShow } from "../../../server/model.ts";
 import { cmd, useOp } from "../lib/store.ts";
-import { Avatar, Icon, SectionLabel, cx, fmtTime, type IconName } from "../lib/ui.tsx";
+import { ask, Avatar, Icon, SectionLabel, cx, fmtTime, type IconName } from "../lib/ui.tsx";
+import { DantePage } from "./DantePage.tsx";
 import { BackstagePage, CharactersPage, DeskPage, ImportDialog, PresetsPage, SettingsPage } from "./Library.tsx";
 
-type Page = { kind: "scene"; id: string } | { kind: "characters" | "presets" | "desk" | "backstage" | "settings" };
+type Page = { kind: "scene"; id: string } | { kind: "characters" | "presets" | "desk" | "dante" | "backstage" | "settings" };
+const LIB_PAGES = ["characters", "presets", "desk", "dante", "backstage", "settings"];
 
 export function BuildMode() {
   const show = useOp((s) => s.show)!;
   const selected = useOp((s) => s.runtime!.selectedSceneId);
-  const [page, setPage] = useState<Page>(() => ({ kind: "scene", id: selected ?? visibleScenes(show)[0]?.id ?? "" }));
+  // #build/dante (the top bar's Dante pill) opens that page.
+  const [page, setPage] = useState<Page>(() => {
+    const want = location.hash.split("/")[1];
+    return LIB_PAGES.includes(want) ? ({ kind: want } as Page) : { kind: "scene", id: selected ?? visibleScenes(show)[0]?.id ?? "" };
+  });
+  useEffect(() => {
+    const f = () => {
+      const want = location.hash.split("/")[1];
+      if (LIB_PAGES.includes(want)) setPage({ kind: want } as Page);
+    };
+    window.addEventListener("hashchange", f);
+    return () => window.removeEventListener("hashchange", f);
+  }, []);
   const [importing, setImporting] = useState(false);
   const scenes = visibleScenes(show);
   const scene = page.kind === "scene" ? scenes.find((s) => s.id === page.id) ?? scenes[0] ?? null : null;
@@ -21,6 +35,7 @@ export function BuildMode() {
     { kind: "characters", icon: "people", label: "Characters" },
     { kind: "presets", icon: "sparkle", label: "Effect presets" },
     { kind: "desk", icon: "desk", label: "Desk mics" },
+    { kind: "dante", icon: "wave", label: "Dante audio" },
     { kind: "backstage", icon: "phone", label: "Backstage" },
     { kind: "settings", icon: "gear", label: "Settings" },
   ];
@@ -56,6 +71,7 @@ export function BuildMode() {
         {page.kind === "characters" && <CharactersPage />}
         {page.kind === "presets" && <PresetsPage />}
         {page.kind === "desk" && <DeskPage />}
+        {page.kind === "dante" && <DantePage />}
         {page.kind === "backstage" && <BackstagePage />}
         {page.kind === "settings" && <SettingsPage onImport={() => setImporting(true)} />}
       </main>
@@ -131,7 +147,7 @@ function SceneEditor({ show, scene }: { show: SoundShow; scene: SoundScene }) {
           <h1 className="mt-1 text-[40px] leading-[1.1] font-black">{scene.name}</h1>
         </div>
         {(scene.removed || scene.source !== "livestage") && (
-          <button type="button" onClick={() => confirm(`Delete scene ${scene.code} “${scene.name}” and its cues?`) && void cmd("scene.remove", { scene: scene.id })} className="inline-flex items-center gap-2 rounded-2xl border-2 border-coral px-4 py-2.5 text-[15px] font-black text-coral-text">
+          <button type="button" onClick={() => void ask(`Delete scene ${scene.code} “${scene.name}” and its cues?`, { ok: "Delete scene" }).then((y) => y && cmd("scene.remove", { scene: scene.id }))} className="inline-flex items-center gap-2 rounded-2xl border-2 border-coral px-4 py-2.5 text-[15px] font-black text-coral-text">
             <Icon name="trash" size={18} />
             Delete scene
           </button>
@@ -268,7 +284,7 @@ function CueGrid({ show, scene }: { show: SoundShow; scene: SoundScene }) {
                 <span className="flex justify-end gap-1">
                   <IconBtn icon="up" label="Move up" disabled={i === 0} onClick={() => void cmd("cue.move", { scene: scene.id, cue: q.id, to: i - 1 })} />
                   <IconBtn icon="down" label="Move down" disabled={i === scene.cues.length - 1} onClick={() => void cmd("cue.move", { scene: scene.id, cue: q.id, to: i + 1 })} />
-                  <IconBtn icon="trash" label="Delete cue" onClick={() => confirm(`Delete Q${i + 1} “${q.label}”?`) && void cmd("cue.remove", { scene: scene.id, cue: q.id })} />
+                  <IconBtn icon="trash" label="Delete cue" onClick={() => void ask(`Delete Q${i + 1} “${q.label}”?`, { ok: "Delete cue" }).then((y) => y && cmd("cue.remove", { scene: scene.id, cue: q.id }))} />
                 </span>
               </div>
               {fxOpen === q.id && (

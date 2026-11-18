@@ -209,13 +209,19 @@ function People({ view, scene, editing, setEditing, assign }: { view: BackstageV
         const mic = scene.mics[c.id];
         const isEditing = editing === c.id;
         const changed = mic !== undefined && mic !== c.defaultMic;
+        // From the sound desk's Dante feed: is this pack sending?
+        const sig = mic !== undefined && view.signal ? view.signal[mic] : undefined;
         return (
           <div key={c.id} className="flex flex-col gap-3.5 rounded-[26px] border-2 bg-card p-3.5" style={{ borderColor: isEditing ? "#B8F25C" : changed ? "#7A5A1F" : "#151922" }}>
             <button type="button" onClick={() => setEditing(isEditing ? null : c.id)} aria-label={`Change mic for ${c.name}`} className="flex items-center gap-3.5 text-left text-text">
               <Avatar c={c} size={68} photoBase={location.hash.startsWith("#c=") ? null : "/photos/"} />
               <span className="flex min-w-0 flex-1 flex-col gap-1">
                 <span className="text-[26px] leading-[1.05] font-black">{c.name}</span>
-                {changed && <span className="self-start rounded-full bg-amber-bg px-2.5 py-0.5 text-xs font-black text-[#FFC970]">CHANGED</span>}
+                <span className="flex flex-wrap gap-1.5">
+                  {changed && <span className="rounded-full bg-amber-bg px-2.5 py-0.5 text-xs font-black text-[#FFC970]">CHANGED</span>}
+                  {sig === false && <span className="rounded-full bg-amber px-2.5 py-0.5 text-xs font-black text-[#1F1404]">NO SIGNAL · CHECK PACK</span>}
+                  {sig === true && <span className="rounded-full bg-lime-card px-2.5 py-0.5 text-xs font-black text-lime">● SENDING</span>}
+                </span>
               </span>
               <span className="flex flex-col items-center gap-0.5">
                 <span className="text-[11px] font-black tracking-[1px] text-muted">MIC</span>
